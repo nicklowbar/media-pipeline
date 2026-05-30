@@ -1,0 +1,62 @@
+[ssh]
+host = "downloads.example.com"
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+# Release group name used when renaming files.
+# Replaces the original uploader group in filenames.
+# Defaults to "REPACK" if omitted.
+group_name = "REPACK"
+
+[plex]
+url = "http://plex:32400"
+
+[plex.sections]
+tvshows = 2
+movies = 1
+music = 3
+comics = 4
+books = 5
+erotic = 6
+games = 7
+
+# Categories define where content comes from and where it goes.
+# Transcode policy is determined per-title after sync (via ffprobe).
+# Only set transcode_policy here if you want to force a default for ALL titles in a category.
+
+[categories.tvshows]
+remote_dir = "tv"
+library_folder = "TvShows"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+
+[categories.music]
+remote_dir = "music"
+library_folder = "Music"
+
+[categories.comics]
+remote_dir = "comics"
+library_folder = "Comics"
+
+[categories.books]
+remote_dir = "books"
+library_folder = "Books"
+
+[categories.erotic]
+remote_dir = "erotic"
+library_folder = "Erotic"
+
+[categories.games]
+remote_dir = "games"
+library_folder = "Games"
+plex_section = null

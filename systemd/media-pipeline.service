@@ -1,0 +1,12 @@
+[Unit]
+Description=Media Pipeline — sync, rename, transcode, and library ingest
+After=network-online.target mnt-mediaserver.automount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/media-pipeline run --config /etc/media-pipeline/config.toml
+User=mediapipe
+Group=mediaserver
+StandardOutput=journal
+StandardError=journal
+EnvironmentFile=-/etc/media-pipeline/.env

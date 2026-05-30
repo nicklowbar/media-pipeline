@@ -4,5 +4,4 @@
 /tmp
 .env
 config/media-pipeline.toml
-PLAN.md
-ARCHITECTURE.md
+Cargo.lock

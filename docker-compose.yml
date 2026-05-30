@@ -1,0 +1,14 @@
+version: "3.8"
+services:
+  media-pipeline:
+    image: media-pipeline:latest
+    container_name: media-pipeline
+    restart: no
+    volumes:
+      - /mnt/mediaserver:/library
+      - /opt/media-pipeline/staging:/staging
+      - /opt/media-pipeline/config:/etc/media-pipeline:ro
+      - /opt/media-pipeline/ssh:/root/.ssh:ro
+      - /opt/media-pipeline/data:/data
+    environment:
+      - PLEX_TOKEN_FILE=/etc/media-pipeline/.env
