@@ -1,0 +1,8 @@
+/target
+*.db
+*.db-journal
+/tmp
+.env
+config/media-pipeline.toml
+PLAN.md
+ARCHITECTURE.md
