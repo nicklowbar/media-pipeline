@@ -7,6 +7,7 @@ use tracing::{info, warn};
 mod config;
 mod db;
 mod library;
+mod metadata;
 mod plex;
 mod pipeline;
 mod policy;

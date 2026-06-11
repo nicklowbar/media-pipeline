@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
-use russh::{client, ChannelId, Disconnect};
-use russh_keys::key::PublicKey;
+use russh::{client, keys::key::PublicKey, ChannelId, Disconnect};
 use russh_sftp::client::SftpSession;
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::Config;
@@ -21,6 +21,7 @@ pub struct SyncEngine {
 
 struct ClientHandler;
 
+#[async_trait::async_trait]
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -36,6 +37,7 @@ impl client::Handler for ClientHandler {
         &mut self,
         _channel: ChannelId,
         _data: &[u8],
+        _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -45,13 +47,7 @@ impl client::Handler for ClientHandler {
         _channel: ChannelId,
         _ext: u32,
         _data: &[u8],
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    async fn eof(
-        &mut self,
-        _channel: ChannelId,
+        _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -59,6 +55,7 @@ impl client::Handler for ClientHandler {
     async fn channel_close(
         &mut self,
         _channel: ChannelId,
+        _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -67,6 +64,8 @@ impl client::Handler for ClientHandler {
         &mut self,
         _channel: ChannelId,
         _max_packet_size: u32,
+        _window_size: u32,
+        _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -74,6 +73,7 @@ impl client::Handler for ClientHandler {
     async fn channel_success(
         &mut self,
         _channel: ChannelId,
+        _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -81,6 +81,7 @@ impl client::Handler for ClientHandler {
     async fn channel_failure(
         &mut self,
         _channel: ChannelId,
+        _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -95,11 +96,11 @@ impl SyncEngine {
 
         info!(host = %config.ssh.host, user = %config.ssh.user, "connecting to ssh");
 
-        let mut session = client::connect(ssh_config, (&config.ssh.host.as_str(), 22), handler)
+        let mut session = client::connect(ssh_config, (config.ssh.host.as_str(), 22u16), handler)
             .await
             .with_context(|| format!("failed to connect to {}:22", config.ssh.host))?;
 
-        let key_pair = russh_keys::load_secret_key(&config.ssh.private_key_path,
+        let key_pair = russh::keys::load_secret_key(&config.ssh.private_key_path,
             None,
         )
         .with_context(|| {
@@ -179,9 +180,8 @@ impl SyncEngine {
         info!(category = %category, count = to_download.len(), "directories to download");
 
         // Download with bounded concurrency
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+        let _semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
 
-        let mut tasks = Vec::new();
         for dir in to_download {
             let sftp = &sftp; // borrow checker: we need to clone sftp or restructure
             // For now, sequential download to avoid SFTP borrow issues
@@ -207,7 +207,7 @@ impl SyncEngine {
         sftp: &SftpSession,
         path: &Path,
     ) -> anyhow::Result<Vec<String>> {
-        let entries = sftp.read_dir(path).await
+        let entries = sftp.read_dir(path.to_string_lossy().into_owned()).await
             .with_context(|| format!("failed to read directory {}", path.display()))?;
 
         let mut dirs = Vec::new();
@@ -247,7 +247,7 @@ impl SyncEngine {
         prefix: &str,
         files: &mut BTreeMap<String, (u64, u64)>,
     ) -> anyhow::Result<()> {
-        let entries = sftp.read_dir(dir).await
+        let entries = sftp.read_dir(dir.to_string_lossy().into_owned()).await
             .with_context(|| format!("failed to read directory {}", dir.display()))?;
 
         for entry in entries {
@@ -264,10 +264,11 @@ impl SyncEngine {
 
             if entry.file_type().is_dir() {
                 let subdir = dir.join(&name);
-                self.collect_manifest(sftp, &subdir, &rel_path, files).await?;
+                Box::pin(self.collect_manifest(sftp, &subdir, &rel_path, files)).await?;
             } else {
-                let size = entry.size().unwrap_or(0) as u64;
-                let mtime = entry.mtime().unwrap_or(0) as u64;
+                let meta = entry.metadata();
+                let size = meta.size.unwrap_or(0) as u64;
+                let mtime = meta.mtime.unwrap_or(0) as u64;
                 files.insert(rel_path, (size, mtime));
             }
         }
@@ -292,7 +293,7 @@ impl SyncEngine {
         fs::create_dir_all(local).await
             .with_context(|| format!("failed to create local directory {}", local.display()))?;
 
-        let entries = sftp.read_dir(remote).await
+        let entries = sftp.read_dir(remote.to_string_lossy().into_owned()).await
             .with_context(|| format!("failed to read remote directory {}", remote.display()))?;
 
         for entry in entries {
@@ -305,7 +306,7 @@ impl SyncEngine {
             let local_item = local.join(&name);
 
             if entry.file_type().is_dir() {
-                self.download_directory(sftp, &remote_item.to_string_lossy(), &local_item.to_string_lossy(), db, dir_id).await?;
+                Box::pin(self.download_directory(sftp, &remote_item.to_string_lossy(), &local_item.to_string_lossy(), db, dir_id)).await?;
             } else {
                 self.download_file(sftp, &remote_item, &local_item).await?;
             }
@@ -323,7 +324,7 @@ impl SyncEngine {
         let remote_str = remote.to_string_lossy();
         trace!(file = %remote_str, "downloading file");
 
-        let remote_meta = sftp.metadata(remote).await
+        let remote_meta = sftp.metadata(remote.to_string_lossy().into_owned()).await
             .with_context(|| format!("failed to stat remote file {}", remote.display()))?;
         let remote_size = remote_meta.size.unwrap_or(0) as u64;
 
@@ -345,13 +346,12 @@ impl SyncEngine {
         }
 
         // Open remote file
-        let mut remote_file = sftp.open(remote).await
+        let mut remote_file = sftp.open(remote.to_string_lossy().into_owned()).await
             .with_context(|| format!("failed to open remote file {}", remote.display()))?;
 
         // Seek if resuming
         let mut offset = local_size;
         if offset > 0 {
-            use tokio::io::AsyncSeekExt;
             remote_file.seek(std::io::SeekFrom::Start(offset)).await
                 .with_context(|| format!("failed to seek remote file {}", remote.display()))?;
             info!(file = %remote_str, offset, "resuming download");
@@ -366,7 +366,6 @@ impl SyncEngine {
             .with_context(|| format!("failed to open local file {}", local.display()))?;
 
         // Stream data
-        use tokio::io::AsyncWriteExt;
         let mut buffer = vec![0u8; 65536];
         loop {
             let n = remote_file.read(&mut buffer).await

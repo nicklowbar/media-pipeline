@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use tracing::{error, info, warn};
@@ -6,6 +8,7 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db::{Database, DirectoryState};
 use crate::library;
+use crate::metadata::{CachedLookup, HttpLookup, MetadataLookup, NoopLookup};
 use crate::plex;
 use crate::policy::DetectedPolicy;
 use crate::rename;
@@ -17,6 +20,29 @@ pub async fn run_full(config: &Config, db: &Database) -> anyhow::Result<()> {
     run_sync(config, db).await?;
     run_process(config, db).await?;
     Ok(())
+}
+
+/// Build the metadata-lookup impl from config. If TMDB credentials are
+/// present, wraps an `HttpLookup` in an in-memory `CachedLookup` with
+/// a SQLite-backed durable layer (`metadata_cache` table). Otherwise
+/// returns `NoopLookup` so the pipeline runs with no API calls. The
+/// result is wrapped in `Arc` so the lookup can be shared across
+/// directory-rename calls in one process.
+pub fn build_metadata_lookup(config: &Config, db: &Database) -> Arc<dyn MetadataLookup> {
+    if config.metadata.has_tmdb_credentials() {
+        let timeout = Duration::from_secs(
+            config.metadata.request_timeout_secs.unwrap_or(5),
+        );
+        let http = HttpLookup::new(timeout);
+        let ttl = Duration::from_secs(
+            config.metadata.cache_ttl_days.unwrap_or(30) * 24 * 60 * 60,
+        );
+        info!("metadata lookup: HttpLookup + CachedLookup (tmdb configured, db-backed cache)");
+        Arc::new(CachedLookup::with_db(Arc::new(http), ttl, Arc::new(db.clone())))
+    } else {
+        info!("metadata lookup: NoopLookup (no tmdb credentials configured)");
+        Arc::new(NoopLookup)
+    }
 }
 
 /// Run only the sync phase
@@ -42,11 +68,18 @@ pub async fn run_sync(config: &Config, db: &Database) -> anyhow::Result<()> {
 pub async fn run_process(config: &Config, db: &Database) -> anyhow::Result<()> {
     info!("starting process phase");
 
+    // Build the metadata-lookup impl from config. The DB is passed
+    // in so the durable layer of `CachedLookup` writes to the same
+    // SQLite file the pipeline uses for everything else. On the
+    // finfunnel deployment (no TMDB env var), this is `NoopLookup`
+    // and the DB layer is unused.
+    let lookup = build_metadata_lookup(config, db);
+
     // 1. Analyze
     analyze_directories(config, db).await?;
 
     // 2. Rename
-    rename_directories(config, db)?;
+    rename_directories(config, db, lookup.as_ref()).await?;
 
     // 3. Transcode
     transcode_directories(config, db).await?;
@@ -88,7 +121,7 @@ async fn analyze_directories(config: &Config, db: &Database) -> anyhow::Result<(
     Ok(())
 }
 
-fn rename_directories(config: &Config, db: &Database) -> anyhow::Result<()> {
+async fn rename_directories(config: &Config, db: &Database, lookup: &dyn MetadataLookup) -> anyhow::Result<()> {
     let dirs = db.get_directories_in_state(DirectoryState::Analyzed)?;
     info!(count = dirs.len(), "directories to rename");
 
@@ -101,7 +134,15 @@ fn rename_directories(config: &Config, db: &Database) -> anyhow::Result<()> {
         let detected_policy = dir.detected_policy.as_deref()
             .and_then(DetectedPolicy::from_str);
 
-        match rename::rename_directory(staging_path, config, &dir.category, db, dir.id, detected_policy.as_ref()) {
+        match rename::rename_directory(
+            staging_path,
+            config,
+            &dir.category,
+            db,
+            dir.id,
+            detected_policy.as_ref(),
+            lookup,
+        ).await {
             Ok(()) => {
                 db.set_directory_state(dir.id, DirectoryState::Renamed)?;
                 info!(dir_id = dir.id, "rename complete");

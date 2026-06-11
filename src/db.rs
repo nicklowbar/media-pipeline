@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -57,8 +58,13 @@ impl DirectoryState {
     }
 }
 
+/// Handle to the pipeline's SQLite database. Cheap to clone — the
+/// underlying `Connection` is shared via `Arc<Mutex<_>>` so multiple
+/// consumers (the rename path, the metadata cache, future workers)
+/// can hold a handle to the same on-disk file.
+#[derive(Clone)]
 pub struct Database {
-    conn: Connection,
+    conn: Arc<std::sync::Mutex<Connection>>,
 }
 
 impl Database {
@@ -66,13 +72,16 @@ impl Database {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open SQLite database at {}", path.display()))?;
 
-        let db = Database { conn };
+        let db = Database {
+            conn: Arc::new(std::sync::Mutex::new(conn)),
+        };
         db.init_schema()?;
         Ok(db)
     }
 
     fn init_schema(&self) -> anyhow::Result<()> {
-        self.conn.execute_batch(
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS directories (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,6 +98,7 @@ impl Database {
                 manifest_hash   TEXT,
                 detected_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
                 synced_at       DATETIME,
+                analyzed_at     DATETIME,
                 renamed_at      DATETIME,
                 transcoded_at   DATETIME,
                 moved_at        DATETIME,
@@ -112,6 +122,25 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_dirs_state ON directories(state);
             CREATE INDEX IF NOT EXISTS idx_dirs_category ON directories(category);
             CREATE INDEX IF NOT EXISTS idx_files_dir ON files(dir_id);
+
+            -- Metadata lookup cache (durable across restarts). Keyed on the
+            -- SHA-256 of (category|without_group); the same key shape the
+            -- in-memory CachedLookup uses. Negative results are NOT cached
+            -- here — the schema only stores positive hits, so a later
+            -- version of the data or a different parse may still succeed.
+            CREATE TABLE IF NOT EXISTS metadata_cache (
+                source_hash     TEXT PRIMARY KEY,
+                category        TEXT NOT NULL,
+                canonical_title TEXT NOT NULL,
+                canonical_year  INTEGER,
+                external_id     TEXT,
+                raw_response    TEXT,
+                fetched_at      TEXT NOT NULL,
+                expires_at      TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_metadata_cache_expires
+                ON metadata_cache(expires_at);
             "#,
         )?;
         Ok(())
@@ -125,7 +154,8 @@ impl Database {
         staging_path: &str,
         manifest_hash: &str,
     ) -> anyhow::Result<()> {
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             r#"
             INSERT INTO directories (category, remote_path, staging_path, state, manifest_hash)
             VALUES (?1, ?2, ?3, 'detected', ?4)
@@ -164,12 +194,12 @@ impl Database {
             "UPDATE directories SET state = ?1, {} = CURRENT_TIMESTAMP WHERE id = ?2",
             timestamp_col
         );
-        self.conn.execute(&sql, params![state_str, id])?;
+        self.conn.lock().unwrap().execute(&sql, params![state_str, id])?;
         Ok(())
     }
 
     pub fn set_directory_error(&self, id: i64, message: &str) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "UPDATE directories SET state = 'failed', error_message = ?1 WHERE id = ?2",
             params![message, id],
         )?;
@@ -181,7 +211,7 @@ impl Database {
         id: i64,
         path: &str,
     ) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "UPDATE directories SET library_path = ?1 WHERE id = ?2",
             params![path, id],
         )?;
@@ -193,7 +223,7 @@ impl Database {
         id: i64,
         policy: &str,
     ) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "UPDATE directories SET detected_policy = ?1 WHERE id = ?2",
             params![policy, id],
         )?;
@@ -201,7 +231,7 @@ impl Database {
     }
 
     pub fn set_plex_scan_at(&self, id: i64) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "UPDATE directories SET plex_scan_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![id],
         )?;
@@ -213,8 +243,9 @@ impl Database {
         &self,
         state: DirectoryState,
     ) -> anyhow::Result<Vec<DirectoryRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, category, remote_path, staging_path, library_path, state, manifest_hash, detected_at, synced_at, renamed_at, transcoded_at, moved_at, detected_policy, plex_scan_at, error_message
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, category, remote_path, staging_path, library_path, state, manifest_hash, detected_at, synced_at, analyzed_at, renamed_at, transcoded_at, moved_at, detected_policy, plex_scan_at, error_message
              FROM directories WHERE state = ?1"
         )?;
 
@@ -229,12 +260,13 @@ impl Database {
                 manifest_hash: row.get(6)?,
                 detected_at: row.get(7)?,
                 synced_at: row.get(8)?,
-                renamed_at: row.get(9)?,
-                transcoded_at: row.get(10)?,
-                moved_at: row.get(11)?,
-                detected_policy: row.get(12)?,
-                plex_scan_at: row.get(13)?,
-                error_message: row.get(14)?,
+                analyzed_at: row.get(9)?,
+                renamed_at: row.get(10)?,
+                transcoded_at: row.get(11)?,
+                moved_at: row.get(12)?,
+                detected_policy: row.get(13)?,
+                plex_scan_at: row.get(14)?,
+                error_message: row.get(15)?,
             })
         })?;
 
@@ -246,8 +278,9 @@ impl Database {
     }
 
     pub fn get_directory_by_id(&self, id: i64) -> anyhow::Result<Option<DirectoryRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, category, remote_path, staging_path, library_path, state, manifest_hash, detected_at, synced_at, renamed_at, transcoded_at, moved_at, plex_scan_at, error_message
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, category, remote_path, staging_path, library_path, state, manifest_hash, detected_at, synced_at, analyzed_at, renamed_at, transcoded_at, moved_at, detected_policy, plex_scan_at, error_message
              FROM directories WHERE id = ?1"
         )?;
 
@@ -262,12 +295,13 @@ impl Database {
                 manifest_hash: row.get(6)?,
                 detected_at: row.get(7)?,
                 synced_at: row.get(8)?,
-                renamed_at: row.get(9)?,
-                transcoded_at: row.get(10)?,
-                moved_at: row.get(11)?,
-                detected_policy: row.get(12)?,
-                plex_scan_at: row.get(13)?,
-                error_message: row.get(14)?,
+                analyzed_at: row.get(9)?,
+                renamed_at: row.get(10)?,
+                transcoded_at: row.get(11)?,
+                moved_at: row.get(12)?,
+                detected_policy: row.get(13)?,
+                plex_scan_at: row.get(14)?,
+                error_message: row.get(15)?,
             })
         }).optional()?;
         Ok(row)
@@ -281,16 +315,17 @@ impl Database {
         transcode_policy: &str,
         needs_transcode: bool,
     ) -> anyhow::Result<i64> {
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "INSERT INTO files (dir_id, original_name, transcode_policy, needs_transcode, transcode_status)
              VALUES (?1, ?2, ?3, ?4, 'pending')",
             params![dir_id, original_name, transcode_policy, needs_transcode as i32],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
     }
 
     pub fn update_file_renamed(&self, id: i64, renamed_name: &str) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "UPDATE files SET renamed_name = ?1 WHERE id = ?2",
             params![renamed_name, id],
         )?;
@@ -298,7 +333,7 @@ impl Database {
     }
 
     pub fn update_file_final(&self, id: i64, final_name: &str, status: &str) -> anyhow::Result<()> {
-        self.conn.execute(
+        self.conn.lock().unwrap().execute(
             "UPDATE files SET final_name = ?1, transcode_status = ?2 WHERE id = ?3",
             params![final_name, status, id],
         )?;
@@ -306,7 +341,8 @@ impl Database {
     }
 
     pub fn get_files_for_directory(&self, dir_id: i64) -> anyhow::Result<Vec<FileRecord>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT id, dir_id, original_name, renamed_name, transcode_policy, transcode_status, needs_transcode, final_name
              FROM files WHERE dir_id = ?1"
         )?;
@@ -332,7 +368,8 @@ impl Database {
     }
 
     pub fn count_directories_by_state(&self) -> anyhow::Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT state, COUNT(*) FROM directories GROUP BY state"
         )?;
         let rows = stmt.query_map([], |row| {
@@ -344,6 +381,120 @@ impl Database {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    // ----------------------------------------------------------------------
+    // Metadata cache (durable, SQLite-backed)
+    //
+    // The metadata-lookup step hits an external API (TMDB/IGDB/etc.) for a
+    // canonical title. To survive process restarts — and to let a second
+    // pipeline invocation skip a re-fetch — the positive results are
+    // persisted here. The cache is *positive-only*: a miss in the API is
+    // not stored, so a later version of the data, or a different parse,
+    // can still succeed.
+    //
+    // The key (source_hash) is the SHA-256 of (category|without_group),
+    // matching the in-memory `CachedLookup` key shape. Storing the same
+    // shape in both layers means the two caches are interchangeable
+    // from the caller's perspective.
+    //
+    // All helper failures are surfaced as `anyhow::Error`. Callers (in
+    // `metadata.rs`) should treat DB errors as "cache miss" rather than
+    // propagating them — the lookup must never block the pipeline.
+    // ----------------------------------------------------------------------
+
+    /// Fetch a cached canonical title. Returns `Ok(None)` on miss OR
+    /// when the row is past its `expires_at` (expired entries are
+    /// treated as misses, not deleted; a separate prune step can
+    /// sweep them later). Returns `Err(_)` only on actual SQL failure
+    /// — callers should log and fall back to the inner lookup.
+    pub fn get_cached_metadata(
+        &self,
+        source_hash: &str,
+    ) -> anyhow::Result<Option<crate::metadata::CanonicalTitle>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT canonical_title, canonical_year, external_id
+                 FROM metadata_cache
+                 WHERE source_hash = ?1 AND expires_at > ?2",
+                params![source_hash, now],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let (title, year_i64, external_id) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let year = year_i64.and_then(|y| u32::try_from(y).ok());
+        Ok(Some(crate::metadata::CanonicalTitle {
+            title,
+            year,
+            external_id,
+            season_count: None,
+        }))
+    }
+
+    /// Persist a positive metadata result. Overwrites any prior row
+    /// for the same `source_hash` (upsert via `ON CONFLICT`). `ttl` is
+    /// applied to the current wall-clock time.
+    pub fn store_cached_metadata(
+        &self,
+        source_hash: &str,
+        category: &str,
+        title: &crate::metadata::CanonicalTitle,
+        ttl: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now();
+        let expires = now + chrono::Duration::from_std(ttl)
+            .unwrap_or_else(|_| chrono::Duration::days(30));
+        let year_i64 = title.year.map(i64::from);
+
+        self.conn.lock().unwrap().execute(
+            r#"
+            INSERT INTO metadata_cache (
+                source_hash, category, canonical_title, canonical_year,
+                external_id, raw_response, fetched_at, expires_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)
+            ON CONFLICT(source_hash) DO UPDATE SET
+                category = excluded.category,
+                canonical_title = excluded.canonical_title,
+                canonical_year = excluded.canonical_year,
+                external_id = excluded.external_id,
+                fetched_at = excluded.fetched_at,
+                expires_at = excluded.expires_at
+            "#,
+            params![
+                source_hash,
+                category,
+                title.title,
+                year_i64,
+                title.external_id,
+                now.to_rfc3339(),
+                expires.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Test-only: count of rows in the metadata_cache table. Used by
+    /// `metadata.rs` tests to assert that negative results are not
+    /// stored.
+    #[cfg(test)]
+    pub fn count_metadata_cache_rows(&self) -> anyhow::Result<i64> {
+        let n: i64 = self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM metadata_cache", [], |r| r.get(0))?;
+        Ok(n)
     }
 }
 
@@ -364,6 +515,7 @@ pub struct DirectoryRecord {
     pub detected_policy: Option<String>,
     pub plex_scan_at: Option<String>,
     pub error_message: Option<String>,
+    pub analyzed_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -503,5 +655,330 @@ mod tests {
 
         let counts = db.count_directories_by_state().unwrap();
         assert_eq!(counts.len(), 2); // detected + synced
+    }
+
+    // ----------------------------------------------------------------------
+    // Sync dedup tests
+    //
+    // The pipeline's "don't re-download unchanged content" guarantee lives in
+    // `upsert_directory` (see `ON CONFLICT` clause above): when an existing
+    // (category, remote_path) row's manifest_hash matches the new one, the
+    // state is preserved. When the hash changes, the state resets to
+    // `detected` for reprocessing. These tests pin that contract.
+    // ----------------------------------------------------------------------
+
+    /// Helper: upsert a directory and return its id.
+    fn make_dir(db: &Database, category: &str, remote: &str, hash: &str) -> i64 {
+        db.upsert_directory(
+            category,
+            remote,
+            &format!("/staging/{}", remote.rsplit('/').next().unwrap_or(remote)),
+            hash,
+        )
+        .unwrap();
+        // New rows are inserted in 'detected' state; there is exactly one
+        // such row for this (category, remote_path) tuple, so fetching by
+        // remote_path via a fresh query gives us its id.
+        let rows = db.get_directories_in_state(DirectoryState::Detected).unwrap();
+        rows.into_iter()
+            .find(|r| r.category == category && r.remote_path == remote)
+            .map(|r| r.id)
+            .expect("upserted row not found in detected state")
+    }
+
+    #[test]
+    fn test_dedup_unchanged_manifest_preserves_state() {
+        let db = in_memory_db();
+        let id = make_dir(&db, "tvshows", "/srv/data/media/tv/Show.A", "hash-A");
+        db.set_directory_state(id, DirectoryState::Synced).unwrap();
+
+        // Re-upsert with the same hash. The row must NOT regress to Detected.
+        db.upsert_directory(
+            "tvshows",
+            "/srv/data/media/tv/Show.A",
+            "/staging/Show.A",
+            "hash-A",
+        )
+        .unwrap();
+
+        let detected = db.get_directories_in_state(DirectoryState::Detected).unwrap();
+        assert!(
+            detected.iter().all(|r| r.id != id),
+            "row with unchanged manifest regressed to Detected — would cause duplicate sync"
+        );
+        let synced = db.get_directories_in_state(DirectoryState::Synced).unwrap();
+        assert_eq!(synced.iter().filter(|r| r.id == id).count(), 1);
+    }
+
+    #[test]
+    fn test_dedup_changed_manifest_resets_to_detected() {
+        let db = in_memory_db();
+        let id = make_dir(&db, "movies", "/srv/data/media/movies/Foo", "hash-A");
+        db.set_directory_state(id, DirectoryState::InLibrary).unwrap();
+
+        let original_detected_at = db
+            .get_directory_by_id(id)
+            .unwrap()
+            .and_then(|r| r.detected_at)
+            .expect("detected_at should be set after initial upsert");
+
+        // Manifest changed on the remote.
+        db.upsert_directory(
+            "movies",
+            "/srv/data/media/movies/Foo",
+            "/staging/Foo",
+            "hash-B",
+        )
+        .unwrap();
+
+        let detected = db.get_directories_in_state(DirectoryState::Detected).unwrap();
+        assert_eq!(
+            detected.iter().filter(|r| r.id == id).count(),
+            1,
+            "row with changed manifest should be queued for reprocessing"
+        );
+        let in_lib = db.get_directories_in_state(DirectoryState::InLibrary).unwrap();
+        assert!(
+            in_lib.iter().all(|r| r.id != id),
+            "row with changed manifest should have left InLibrary"
+        );
+
+        let refreshed_detected_at = db
+            .get_directory_by_id(id)
+            .unwrap()
+            .and_then(|r| r.detected_at)
+            .expect("detected_at should be set after re-upsert");
+        // Wall-clock may not advance between two close upserts; assert the
+        // value is present and the state was reset. A strict comparison
+        // would be flaky on fast machines.
+        assert!(!refreshed_detected_at.is_empty());
+        // And the error_message from any prior failure must have been cleared.
+        let dir = db.get_directory_by_id(id).unwrap().unwrap();
+        assert!(dir.error_message.is_none());
+        let _ = original_detected_at; // referenced only to make the timestamp semantics explicit
+    }
+
+    #[test]
+    fn test_dedup_per_category_independence() {
+        let db = in_memory_db();
+        // The UNIQUE(category, remote_path) constraint means the same path
+        // can exist once per category. This is how the pipeline keeps
+        // movies/ and tv/ namespaces from colliding.
+        let movies_id = make_dir(&db, "movies", "/srv/data/media/shared/Foo", "m-hash");
+        let tv_id = make_dir(&db, "tvshows", "/srv/data/media/shared/Foo", "t-hash");
+        assert_ne!(movies_id, tv_id);
+
+        let detected = db.get_directories_in_state(DirectoryState::Detected).unwrap();
+        assert_eq!(detected.len(), 2);
+    }
+
+    #[test]
+    fn test_dedup_idempotent_under_repeated_calls() {
+        let db = in_memory_db();
+        // The 1-hour sync timer will fire many times for the same remote
+        // content. Each call must be a no-op once the manifest is stable.
+        for _ in 0..5 {
+            db.upsert_directory(
+                "movies",
+                "/srv/data/media/movies/Foo",
+                "/staging/Foo",
+                "stable-hash",
+            )
+            .unwrap();
+        }
+
+        let detected = db.get_directories_in_state(DirectoryState::Detected).unwrap();
+        assert_eq!(
+            detected.len(),
+            1,
+            "repeated upserts of the same (category, path, hash) should produce one row"
+        );
+    }
+
+    #[test]
+    fn test_dedup_failed_state_recovered_by_manifest_change() {
+        let db = in_memory_db();
+        let id = make_dir(&db, "tvshows", "/srv/data/media/tv/Broken", "hash-X");
+        db.set_directory_error(id, "rsync connection timed out").unwrap();
+
+        let failed = db.get_directories_in_state(DirectoryState::Failed).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].error_message.as_deref(),
+            Some("rsync connection timed out")
+        );
+
+        // New manifest hash arrives — pipeline should reset to Detected
+        // and clear the error so the next sync run picks it up.
+        db.upsert_directory(
+            "tvshows",
+            "/srv/data/media/tv/Broken",
+            "/staging/Broken",
+            "hash-Y",
+        )
+        .unwrap();
+
+        let after = db.get_directory_by_id(id).unwrap().unwrap();
+        assert_eq!(after.state, DirectoryState::Detected);
+        assert!(after.error_message.is_none());
+    }
+
+    #[test]
+    fn test_dedup_state_machine_round_trip() {
+        let db = in_memory_db();
+        let id = make_dir(&db, "tvshows", "/srv/data/media/tv/Show.B", "hash-B");
+
+        // Walk the full state machine.
+        for s in [
+            DirectoryState::Syncing,
+            DirectoryState::Synced,
+            DirectoryState::Analyzing,
+            DirectoryState::Analyzed,
+            DirectoryState::Renaming,
+            DirectoryState::Renamed,
+            DirectoryState::Transcoding,
+            DirectoryState::Transcoded,
+            DirectoryState::Moving,
+            DirectoryState::InLibrary,
+        ] {
+            db.set_directory_state(id, s).unwrap();
+        }
+
+        // Subsequent timer fires with the same manifest must NOT re-process.
+        for _ in 0..3 {
+            db.upsert_directory(
+                "tvshows",
+                "/srv/data/media/tv/Show.B",
+                "/staging/Show.B",
+                "hash-B",
+            )
+            .unwrap();
+            let after = db.get_directory_by_id(id).unwrap().unwrap();
+            assert_eq!(
+                after.state,
+                DirectoryState::InLibrary,
+                "completed row regressed under same-hash upsert"
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Metadata cache tests
+    //
+    // The metadata_cache table is the durable layer for canonical-
+    // title lookups. These tests pin the SQL-level contract:
+    // upsert, retrieval, expiry filter, key uniqueness.
+    // ----------------------------------------------------------------------
+
+    use crate::metadata::CanonicalTitle;
+
+    fn make_title(title: &str, year: Option<u32>, ext_id: &str) -> CanonicalTitle {
+        CanonicalTitle {
+            title: title.to_string(),
+            year,
+            external_id: ext_id.to_string(),
+            season_count: None,
+        }
+    }
+
+    #[test]
+    fn test_metadata_cache_miss_returns_none() {
+        let db = in_memory_db();
+        let result = db.get_cached_metadata("nonexistent-hash").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_metadata_cache_store_and_retrieve() {
+        let db = in_memory_db();
+        let title = make_title("Shoresy", Some(2022), "tt14058038");
+
+        db.store_cached_metadata(
+            "hash-1",
+            "movies",
+            &title,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+
+        let result = db.get_cached_metadata("hash-1").unwrap();
+        let cached = result.expect("row should be present");
+        assert_eq!(cached.title, "Shoresy");
+        assert_eq!(cached.year, Some(2022));
+        assert_eq!(cached.external_id, "tt14058038");
+    }
+
+    #[test]
+    fn test_metadata_cache_upsert_overwrites_prior_row() {
+        let db = in_memory_db();
+        let original = make_title("Original", Some(2020), "tt-orig");
+        let updated = make_title("Updated", Some(2021), "tt-upd");
+
+        db.store_cached_metadata(
+            "hash-shared",
+            "movies",
+            &original,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        db.store_cached_metadata(
+            "hash-shared",
+            "movies",
+            &updated,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+
+        // Same key → same row (PRIMARY KEY), value updated.
+        assert_eq!(db.count_metadata_cache_rows().unwrap(), 1);
+        let cached = db.get_cached_metadata("hash-shared").unwrap().unwrap();
+        assert_eq!(cached.title, "Updated");
+        assert_eq!(cached.year, Some(2021));
+    }
+
+    #[test]
+    fn test_metadata_cache_expired_entry_treated_as_miss() {
+        // Store an entry that's already past its expires_at by writing
+        // it with a 0-second TTL and sleeping briefly. The `WHERE
+        // expires_at > now` filter in the read should drop it.
+        let db = in_memory_db();
+        let title = make_title("ExpireSoon", Some(2024), "tt-exp");
+
+        // Use a TTL of 1s so the row exists but expires soon.
+        db.store_cached_metadata(
+            "hash-exp",
+            "movies",
+            &title,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        // Row is present immediately.
+        let present = db.get_cached_metadata("hash-exp").unwrap();
+        assert!(present.is_some(), "row should be cached just after write");
+
+        // Wait past the TTL.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let after_expiry = db.get_cached_metadata("hash-exp").unwrap();
+        assert!(after_expiry.is_none(), "expired row should be invisible to reads");
+    }
+
+    #[test]
+    fn test_metadata_cache_handles_missing_year() {
+        // year is Option<u32> in the struct, Option<i64> in SQLite
+        // (NULL when None). Verify the round-trip preserves the None.
+        let db = in_memory_db();
+        let title = make_title("Yearless", None, "tt-y");
+
+        db.store_cached_metadata(
+            "hash-y",
+            "movies",
+            &title,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+
+        let cached = db.get_cached_metadata("hash-y").unwrap().unwrap();
+        assert_eq!(cached.title, "Yearless");
+        assert_eq!(cached.year, None);
     }
 }

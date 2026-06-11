@@ -21,6 +21,7 @@ toml = "0.8"
 # SSH / SFTP
 russh = { version = "0.45", features = ["openssl"] }
 russh-sftp = "2.0"
+async-trait = "0.1"
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
@@ -61,6 +62,14 @@ indicatif = "0.17"
 [dev-dependencies]
 tokio-test = "0.4"
 pretty_assertions = "1.4"
+injectorpp = "0.5"
+
+[profile.test]
+opt-level = 0
+debug = true
+lto = false
+codegen-units = 1
+incremental = false
 
 [profile.release]
 opt-level = 3

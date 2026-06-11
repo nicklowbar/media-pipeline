@@ -5,3 +5,6 @@
 .env
 config/media-pipeline.toml
 Cargo.lock
+
+# IDE
+.vscode/

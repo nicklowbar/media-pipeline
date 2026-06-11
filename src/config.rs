@@ -15,6 +15,10 @@ pub struct Config {
     /// Defaults to "REPACK" if not specified.
     pub group_name: Option<String>,
     pub categories: HashMap<String, CategoryConfig>,
+    /// Metadata-lookup configuration. Optional — when omitted, the
+    /// pipeline uses `NoopLookup` (no API calls).
+    #[serde(default)]
+    pub metadata: MetadataConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +43,7 @@ pub struct PathsConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlexConfig {
     pub url: String,
+    #[serde(default)]
     pub sections: HashMap<String, i64>,
 }
 
@@ -71,6 +76,41 @@ impl TranscodePolicy {
             TranscodePolicy::None => "none",
             TranscodePolicy::X264ToX265 => "x264_to_x265",
             TranscodePolicy::Downscale1080p => "downscale_1080p",
+        }
+    }
+}
+
+/// Configuration for the metadata-lookup step. When `tmdb_api_key_env`
+/// is unset (or the corresponding env var is missing), the pipeline
+/// selects `NoopLookup` and the lookup step is a no-op. The actual
+/// key is read from the environment at runtime — never written to
+/// disk or to the config file.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MetadataConfig {
+    /// Name of the env var that holds the TMDB API key. If unset or the
+    /// env var is missing, `NoopLookup` is used.
+    #[serde(default)]
+    pub tmdb_api_key_env: Option<String>,
+    /// Categories that should hit the API. Defaults to all of them.
+    /// Names must match keys in `categories`.
+    #[serde(default)]
+    pub enabled_categories: Option<Vec<String>>,
+    /// Per-request timeout in seconds. Defaults to 5s.
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
+    /// In-memory cache TTL in days. Defaults to 30.
+    #[serde(default)]
+    pub cache_ttl_days: Option<u64>,
+}
+
+impl MetadataConfig {
+    /// Returns true if a TMDB API key is configured AND the env var
+    /// is set in the current process. Used to decide between
+    /// `NoopLookup` and `HttpLookup` at startup.
+    pub fn has_tmdb_credentials(&self) -> bool {
+        match &self.tmdb_api_key_env {
+            Some(env_var) => std::env::var(env_var).is_ok(),
+            None => false,
         }
     }
 }
@@ -258,5 +298,75 @@ library_folder = "Movies"
         let temp = create_temp_config(toml);
         let config = Config::load(temp.path()).unwrap();
         assert_eq!(config.group_name(), "REPACK");
+    }
+
+    #[test]
+    fn test_metadata_config_defaults_to_noop() {
+        // No `[metadata]` section at all — should default to noop.
+        let toml = r#"
+[ssh]
+host = "downloads.example.com"
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+[plex]
+url = "http://plex:32400"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+"#;
+        let temp = create_temp_config(toml);
+        let config = Config::load(temp.path()).unwrap();
+        assert!(!config.metadata.has_tmdb_credentials());
+    }
+
+    #[test]
+    fn test_metadata_config_tmdb_key_env_var_present() {
+        // Config names the env var; the env var is set; should report
+        // credentials present.
+        let toml = r#"
+[ssh]
+host = "downloads.example.com"
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+[plex]
+url = "http://plex:32400"
+
+[metadata]
+tmdb_api_key_env = "TEST_TMDB_KEY_VAR_FOR_CONFIG"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+"#;
+        let temp = create_temp_config(toml);
+        let config = Config::load(temp.path()).unwrap();
+
+        // The env var isn't set; should report no credentials.
+        std::env::remove_var("TEST_TMDB_KEY_VAR_FOR_CONFIG");
+        assert!(!config.metadata.has_tmdb_credentials());
+
+        // Set it; should report credentials present.
+        std::env::set_var("TEST_TMDB_KEY_VAR_FOR_CONFIG", "fake-key");
+        assert!(config.metadata.has_tmdb_credentials());
+        std::env::remove_var("TEST_TMDB_KEY_VAR_FOR_CONFIG");
     }
 }
