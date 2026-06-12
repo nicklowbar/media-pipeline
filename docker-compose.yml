@@ -1,14 +1,43 @@
 version: "3.8"
 services:
   media-pipeline:
-    image: media-pipeline:latest
+    #image: media-pipeline:latest
+    image: media-pipeline:test
     container_name: media-pipeline
+    # The image runs as uid/gid 1000 (user `pipeline`) so files written
+    # to the bind-mounted volumes are owned by the host's first
+    # interactive user, not root. If your host user is not uid 1000,
+    # either run `usermod -u 1000 <your-user>` or change the uid in
+    # the Dockerfile to match.
+    user: "1000:1000"
+    # tini (PID 1) handles SIGTERM/SIGINT cleanly so the pipeline
+    # daemon doesn't have to. `restart: no` matches the existing
+    # systemd unit - runs are scheduled, not long-lived.
+    init: true
     restart: no
     volumes:
+      # Data volumes. The image's defaults assume these paths; if
+      # you bind-mount to a different host location, set the matching
+      # MEDIA_PIPELINE_* env var below so the binary finds the data.
       - /mnt/mediaserver:/library
       - /opt/media-pipeline/staging:/staging
-      - /opt/media-pipeline/config:/etc/media-pipeline:ro
       - /opt/media-pipeline/ssh:/root/.ssh:ro
       - /opt/media-pipeline/data:/data
     environment:
+      # Plex auth. The pipeline reads the token from this file so
+      # the secret never appears in `docker inspect` output.
       - PLEX_TOKEN_FILE=/etc/media-pipeline/.env
+      # Host-specific overrides. The image is self-sufficient: it
+      # bakes a default config.toml with sensible category/section
+      # values. Set these to point the binary at your network.
+      # Documented in config/media-pipeline.toml.example.
+      - MEDIA_PIPELINE_SSH_HOST=${MEDIA_PIPELINE_SSH_HOST}
+      - MEDIA_PIPELINE_SSH_USER=${MEDIA_PIPELINE_SSH_USER}
+      - MEDIA_PIPELINE_SSH_KEY=${MEDIA_PIPELINE_SSH_KEY:-/root/.ssh/id_rsa}
+      - MEDIA_PIPELINE_SSH_REMOTE_BASE=${MEDIA_PIPELINE_SSH_REMOTE_BASE}
+      - MEDIA_PIPELINE_PLEX_URL=${MEDIA_PIPELINE_PLEX_URL}
+      - MEDIA_PIPELINE_TMDB_API_KEY=${MEDIA_PIPELINE_TMDB_API_KEY}
+    # To override structural config (categories, section IDs, etc.)
+    # bind-mount a custom TOML over the baked-in one:
+    #   volumes:
+    #     - /opt/media-pipeline/config.toml:/etc/media-pipeline/config.toml:ro

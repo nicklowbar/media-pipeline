@@ -1,0 +1,30 @@
+# Build artifacts — rebuilt in the image.
+target/
+
+# VCS
+.git/
+.gitignore
+
+# Claude tooling
+.claude/
+
+# Runtime data the binary creates. Bind-mount /data when running.
+/data/
+
+# Editor / OS noise
+.vscode/
+*.swp
+.DS_Store
+
+# Secrets — never bake into an image.
+/secrets/
+*.password
+*.key
+*.pem
+
+# Tests at integration level (kept locally; cargo test runs against src/).
+# Uncomment to skip copying these into the build context.
+# tests/
+
+# CI / infra
+.github/

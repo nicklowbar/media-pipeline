@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 mod config;
 mod db;
+mod layout;
 mod library;
 mod metadata;
 mod plex;
@@ -58,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("media-pipeline starting");
 
-    let config = Config::load(&cli.config)
+    let config = Config::load_with_env(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
     info!(config_path = %cli.config.display(), "config loaded");

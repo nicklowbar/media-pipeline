@@ -3,7 +3,6 @@
 *.db-journal
 /tmp
 .env
-config/media-pipeline.toml
 Cargo.lock
 
 # IDE

@@ -1,3 +1,26 @@
+# media-pipeline configuration
+#
+# Precedence for every overridable field:
+#   1. Environment variable (if set and non-empty)
+#   2. Value in this file
+#   3. In-code default
+#
+# Stable env-var names (defined in src/config.rs::env):
+#   MEDIA_PIPELINE_SSH_HOST         overrides [ssh].host
+#   MEDIA_PIPELINE_SSH_USER         overrides [ssh].user
+#   MEDIA_PIPELINE_SSH_KEY          overrides [ssh].private_key_path
+#   MEDIA_PIPELINE_SSH_REMOTE_BASE  overrides [ssh].remote_base_path
+#   MEDIA_PIPELINE_DATABASE_PATH    overrides [database].path
+#   MEDIA_PIPELINE_STAGING          overrides [paths].staging
+#   MEDIA_PIPELINE_LIBRARY          overrides [paths].library
+#   MEDIA_PIPELINE_PLEX_URL         overrides [plex].url
+#   MEDIA_PIPELINE_TMDB_API_KEY     overrides [metadata].tmdb_api_key
+#
+# This file is shipped inside the container at /etc/media-pipeline/config.toml
+# and is the source of truth for the pipeline's *structure* (categories,
+# section IDs). Host-specific values are typically overridden via env vars
+# in docker-compose.yml or systemd's EnvironmentFile.
+
 [ssh]
 host = "downloads.example.com"
 user = "mediapipe"
@@ -11,14 +34,16 @@ path = "/data/pipeline.db"
 staging = "/staging"
 library = "/library"
 
-# Release group name used when renaming files.
-# Replaces the original uploader group in filenames.
-# Defaults to "REPACK" if omitted.
+# Release group name used when renaming files. Replaces the original
+# uploader group in filenames. Defaults to "REPACK" if omitted.
 group_name = "REPACK"
 
 [plex]
 url = "http://plex:32400"
 
+# Map of category name to Plex section key. Section IDs are server-
+# specific; if you're running multiple Plex instances, override this
+# list in your own config file (the bind-mount target in compose).
 [plex.sections]
 tvshows = 2
 movies = 1
@@ -27,6 +52,21 @@ comics = 4
 books = 5
 erotic = 6
 games = 7
+
+# Metadata lookups are best-effort and disabled by default. To enable
+# TMDB, populate `tmdb_api_key` here OR set `MEDIA_PIPELINE_TMDB_API_KEY`
+# in the environment (env var wins). The pipeline reads the resolved
+# value at startup; if it's empty, `NoopLookup` is used and the
+# lookup step is a no-op.
+#
+# `enabled_categories` defaults to all categories; restrict it to
+# e.g. `["movies", "tvshows"]` if you only want lookups for those.
+#
+# [metadata]
+# tmdb_api_key = ""
+# enabled_categories = ["movies", "tvshows"]
+# request_timeout_secs = 5
+# cache_ttl_days = 30
 
 # Categories define where content comes from and where it goes.
 # Transcode policy is determined per-title after sync (via ffprobe).

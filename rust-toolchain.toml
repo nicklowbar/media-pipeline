@@ -1,0 +1,19 @@
+# Pin the Rust toolchain for this project.
+#
+# `channel = "nightly"` is required because a downstream crate uses
+# the `edition2024` cargo feature, which is unstable on stable.
+# media-pipeline itself stays on edition = "2021" — only the
+# toolchain changes.
+#
+# The Dockerfile's builder stage uses the `rustlang/rust:nightly-bookworm`
+# base image, and this file keeps local `cargo` invocations aligned
+# with that. Developers with rustup get the toolchain auto-installed
+# when they run `cargo` in this directory.
+#
+# Note: with "nightly" (no date), builds are not bit-reproducible —
+# today's image and next week's may produce slightly different
+# binaries. If reproducibility ever matters, replace with
+# `channel = "nightly-YYYY-MM-DD"`.
+[toolchain]
+channel = "nightly"
+components = ["rustfmt", "clippy"]
