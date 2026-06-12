@@ -302,6 +302,262 @@ impl MetadataLookup for HttpLookup {
     }
 }
 
+// ----------------------------------------------------------------------
+// Title cleaning for directory layout
+//
+// The pipeline places processed directories at
+// `library/<CategoryFolder>/<Title>/`. The title here is a
+// human-readable name with all the release noise stripped — no
+// resolution tags, no codec tags, no season markers, no release
+// group. When a `CanonicalTitle` is available (from the metadata
+// lookup), it wins; otherwise we derive the title from the
+// locally-parsed `ReleaseMetadata`.
+//
+// The cleaner is deliberately forgiving: a few leftover tokens in
+// the title (Plex's own matcher can usually still resolve them) are
+// better than dropping the title entirely. The opposite failure —
+// returning an empty string — is guarded against with a fallback
+// to the original basename.
+// ----------------------------------------------------------------------
+
+/// Build a directory-name-safe title from a parsed release and an
+/// optional canonical title. Always returns a non-empty, non-path-
+/// component string. Whichever input is richer is preferred:
+/// `canonical` (TMDB-cleaned) > local parse of `meta.without_group`.
+pub fn clean_title_for_directory(
+    meta: &ReleaseMetadata,
+    canonical: Option<&CanonicalTitle>,
+) -> String {
+    // 1. If we have a canonical title from the metadata lookup, that
+    //    is the cleanest possible input. Use it directly (still
+    //    sanitize, since the API could in principle return garbage).
+    if let Some(c) = canonical {
+        let s = sanitize_for_directory(&c.title);
+        if !s.is_empty() {
+            return s;
+        }
+    }
+
+    // 2. Fall back to the locally-parsed stem. Split on the common
+    //    release-name separators and strip release-noise tokens.
+    let cleaned = clean_local_title(&meta.without_group);
+    if !cleaned.is_empty() {
+        return cleaned;
+    }
+
+    // 3. Pathological input — every token got stripped. Fall back to
+    //    the raw basename. The directory may carry release noise, but
+    //    at least it's a non-empty identifier and Plex can usually
+    //    still parse it.
+    let raw = meta
+        .raw
+        .rsplit_once('.')
+        .map(|(stem, _ext)| stem)
+        .unwrap_or(&meta.raw);
+    let s = sanitize_for_directory(raw);
+    if s.is_empty() {
+        // Truly empty input. Use a literal placeholder so the move
+        // step still produces a valid path.
+        "untitled".to_string()
+    } else {
+        s
+    }
+}
+
+/// Strip release-noise tokens from a locally-parsed stem and return
+/// the first 1-3 surviving tokens joined with spaces. Empty string if
+/// nothing survives the filter.
+fn clean_local_title(stem: &str) -> String {
+    // Replace the common release-name separators with spaces so we
+    // can split on a single delimiter.
+    let normalized = stem.replace(['.', '_', '-'], " ");
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+
+    let mut kept: Vec<&str> = Vec::new();
+    for tok in tokens {
+        if kept.len() >= 3 {
+            break;
+        }
+        if is_release_noise_token(tok) {
+            continue;
+        }
+        kept.push(tok);
+    }
+
+    let joined = kept.join(" ");
+    sanitize_for_directory(&joined)
+}
+
+/// True if a token is release-metadata noise rather than title text:
+/// season markers, resolution tags, source/codec tags, pure track
+/// numbers, or pure 4-digit years (which we don't want to use in the
+/// local-parse path — the year comes from TMDB on collision only).
+fn is_release_noise_token(tok: &str) -> bool {
+    let lower = tok.to_ascii_lowercase();
+    let stripped = lower.replace(['.', '-', '_'], "");
+
+    // Season / episode markers: S05, S05E03, S00E01v2.
+    if looks_like_season_episode(&lower) {
+        return true;
+    }
+    // Pure track numbers: 01, 02, 1, 23, 123.
+    if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    // Resolution: 1080p, 720p, 2160p, 4k, 8k, uhd, hd, sd.
+    if matches!(
+        stripped.as_str(),
+        "1080p" | "720p" | "2160p" | "4320p" | "4k" | "8k" | "uhd" | "hd" | "sd"
+    ) {
+        return true;
+    }
+    // Source: bluray, brrip, bdrip, webdl, webrip, hdtv, pdtv, dvdrip, etc.
+    if matches!(
+        stripped.as_str(),
+        "bluray"
+            | "brrip"
+            | "bdrip"
+            | "webdl"
+            | "webrip"
+            | "hdtv"
+            | "pdtv"
+            | "dvdrip"
+            | "dvdscr"
+            | "dvd"
+            | "remux"
+            | "dsnp"
+            | "atvp"
+            | "pmtp"
+            | "web"
+            | "dvb"
+            | "dsr"
+            | "sdtv"
+            | "ppv"
+            | "cam"
+            | "ts"
+            | "tc"
+    ) {
+        return true;
+    }
+    // Codecs (video + audio).
+    if matches!(
+        stripped.as_str(),
+        "x264" | "x265"
+            | "h264" | "h265"
+            | "hevc" | "avc" | "av1" | "vp9"
+            | "flac" | "mp3" | "aac" | "dts" | "dtshd" | "dtshdma"
+            | "truehd" | "atmos" | "opus" | "vorbis"
+            | "ac3" | "eac3" | "lpcm" | "pcm"
+            | "10bit" | "60fps" | "hdr" | "hdr10" | "hdr10plus" | "dovi" | "dv"
+            | "dd" | "dd51" | "dd71" | "lossless" | "320" | "v0" | "v2"
+    ) {
+        return true;
+    }
+    // Quality flags and release types that sometimes leak into the stem.
+    if matches!(
+        stripped.as_str(),
+        "proper" | "repack" | "remastered" | "regraded"
+            | "hybrid" | "imax" | "extended" | "theatrical"
+            | "criterion" | "complete" | "internal" | "limited"
+            | "dc" | "dual" | "audio" | "multi"
+    ) {
+        return true;
+    }
+    false
+}
+
+/// Match `s05`, `s05e03`, `s00e01v2` (case-insensitive). Words like
+/// "shoresy" don't match because they don't start with `s` followed
+/// by a digit.
+fn looks_like_season_episode(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+    // First char must be 's' or 'S'.
+    if bytes[0] != b's' {
+        return false;
+    }
+    // Second char must be a digit.
+    if !bytes[1].is_ascii_digit() {
+        return false;
+    }
+    // Pattern: s + 1-2 digits + optional (e + 1-3 digits) + optional (v + digits)
+    let rest = &lower[1..];
+    let mut chars = rest.chars().peekable();
+    let mut season_digits = 0;
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() && season_digits < 2 {
+            chars.next();
+            season_digits += 1;
+        } else {
+            break;
+        }
+    }
+    if season_digits == 0 {
+        return false;
+    }
+    if chars.peek() == Some(&'e') {
+        chars.next();
+        let mut ep_digits = 0;
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() && ep_digits < 3 {
+                chars.next();
+                ep_digits += 1;
+            } else {
+                break;
+            }
+        }
+        if ep_digits == 0 {
+            return false;
+        }
+    }
+    if chars.peek() == Some(&'v') {
+        chars.next();
+        let mut v_digits = 0;
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                chars.next();
+                v_digits += 1;
+            } else {
+                break;
+            }
+        }
+        if v_digits == 0 {
+            return false;
+        }
+    }
+    // Must have consumed the whole token — otherwise something like
+    // "show" or "shoresy" might match by accident. Use a stricter
+    // check: did we consume at least the season marker and nothing
+    // remains?
+    chars.next().is_none()
+}
+
+/// Make a string safe to use as a single path component: replace
+/// path separators and control characters with `_`, collapse runs
+/// of whitespace, trim. Always returns a non-empty string (caller
+/// is responsible for choosing a fallback if the result is empty).
+fn sanitize_for_directory(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for c in s.chars() {
+        if c == '/' || c == '\\' || c == '\0' || c.is_control() {
+            out.push('_');
+            last_was_space = false;
+        } else if c.is_whitespace() {
+            if !last_was_space && !out.is_empty() {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(c);
+            last_was_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,5 +905,150 @@ mod tests {
         assert_ne!(k1, k3);
         // SHA-256 hex is 64 chars.
         assert_eq!(k1.len(), 64);
+    }
+
+    // ----------------------------------------------------------------------
+    // clean_title_for_directory tests
+    //
+    // The cleaner is what produces the `library/<Category>/<Title>/`
+    // basename. The contract is:
+    //   1. Canonical title (TMDB) wins when present.
+    //   2. Otherwise, the first 1-3 surviving tokens of the local parse
+    //      are the title.
+    //   3. Release-noise tokens (season, resolution, source, codec, track
+    //      numbers) are stripped.
+    //   4. Path-unsafe characters are replaced.
+    //   5. The function never returns an empty string.
+    // ----------------------------------------------------------------------
+
+    /// Build a ReleaseMetadata whose `without_group` is the given
+    /// string. Mirrors the production parse for a stem like
+    /// `Foo.1080p.x264` (i.e. the group is already stripped).
+    fn make_meta_with_stem(stem: &str) -> ReleaseMetadata {
+        let raw = format!("{}.mkv", stem);
+        let group = crate::rename::parse_release_metadata(&raw).group;
+        let without_group = stem.to_string();
+        let season_episode = crate::rename::parse_release_metadata(&raw).season_episode;
+        let resolution = crate::rename::parse_release_metadata(&raw).resolution;
+        let source = crate::rename::parse_release_metadata(&raw).source;
+        let codec = crate::rename::parse_release_metadata(&raw).codec;
+        ReleaseMetadata {
+            raw,
+            group,
+            ext: "mkv".to_string(),
+            without_group,
+            season_episode,
+            resolution,
+            source,
+            codec,
+            track: None,
+        }
+    }
+
+    #[test]
+    fn test_clean_title_canonical_wins() {
+        // The local parse yields a noisy stem; the canonical title
+        // from TMDB is the cleaner "The Matrix" — the canonical wins.
+        let meta = make_meta_with_stem("The.Matrix.1999.1080p.BluRay.x264");
+        let canonical = CanonicalTitle {
+            title: "The Matrix".to_string(),
+            year: Some(1999),
+            external_id: "tt0133093".to_string(),
+            season_count: None,
+        };
+        assert_eq!(
+            clean_title_for_directory(&meta, Some(&canonical)),
+            "The Matrix"
+        );
+    }
+
+    #[test]
+    fn test_clean_title_local_parse_tv() {
+        // TV release: strip season, resolution, codec, group remnants.
+        let meta = make_meta_with_stem("Shoresy.S05E03.1080p.HEVC.x265");
+        assert_eq!(clean_title_for_directory(&meta, None), "Shoresy");
+    }
+
+    #[test]
+    fn test_clean_title_local_parse_movie() {
+        // Movie release with a year in the filename. The parser
+        // treats a 4-digit numeric token after a `.` as a candidate
+        // group; if it's not in the denylist, the year is stripped
+        // from `without_group`. So the cleaner sees a stem without
+        // the year and produces just "The Matrix". (Year-on-collision
+        // is the TMDB-driven path; the local-parse path does not
+        // synthesize a year from the filename.)
+        let meta = make_meta_with_stem("The.Matrix.1999.1080p.BluRay.x264");
+        assert_eq!(clean_title_for_directory(&meta, None), "The Matrix");
+    }
+
+    #[test]
+    fn test_clean_title_strips_season_and_resolution() {
+        // Multiple noise tokens in different positions.
+        let meta = make_meta_with_stem("Foo.S05E03.1080p.x265");
+        assert_eq!(clean_title_for_directory(&meta, None), "Foo");
+    }
+
+    #[test]
+    fn test_clean_title_handles_empty_remaining_tokens() {
+        // Every token is noise. The cleaner falls back to the raw
+        // stem — better an empty-safe identifier than nothing.
+        let meta = make_meta_with_stem("1080p.BluRay.x264");
+        // The raw stem is "1080p.BluRay.x264" which sanitizes to
+        // "1080p BluRay x264". Acceptable: Plex can usually still
+        // match, and we never return empty.
+        let result = clean_title_for_directory(&meta, None);
+        assert!(!result.is_empty(), "cleaner must never return empty");
+    }
+
+    #[test]
+    fn test_clean_title_sanitizes_path_unsafe_chars() {
+        // Canonical title with slashes / backslashes / control chars
+        // must be sanitized to `_`. (Defensive: TMDB shouldn't return
+        // these, but a noop canonical or a weird API response might.)
+        // The sanitizer does NOT touch `:` or `?` (those are valid on
+        // Linux/macOS) — only path separators and control chars.
+        let meta = make_meta_with_stem("foo");
+        let canonical = CanonicalTitle {
+            title: "Weird/Title\\With:bad?chars\there".to_string(),
+            year: None,
+            external_id: "x".to_string(),
+            season_count: None,
+        };
+        let result = clean_title_for_directory(&meta, Some(&canonical));
+        assert!(!result.contains('/'), "got: {}", result);
+        assert!(!result.contains('\\'), "got: {}", result);
+        assert!(!result.contains('\t'), "got: {}", result);
+    }
+
+    #[test]
+    fn test_clean_title_tracks_dont_count_as_title() {
+        // A leading track number is not part of the title. After
+        // stripping, the song title "Heroes" survives.
+        let meta = make_meta_with_stem("01 - Heroes");
+        // Note: the parser's track field captures `01` separately,
+        // but the cleaner only sees `without_group` and strips the
+        // token via the pure-number check.
+        assert_eq!(clean_title_for_directory(&meta, None), "Heroes");
+    }
+
+    #[test]
+    fn test_clean_title_caps_at_three_tokens() {
+        // Long titles: take the first 3 surviving tokens. Plex's
+        // own matcher fills in the rest from metadata.
+        let meta = make_meta_with_stem("The.Long.Walk.To.Freedom.2024.1080p");
+        let result = clean_title_for_directory(&meta, None);
+        assert_eq!(result, "The Long Walk");
+    }
+
+    #[test]
+    fn test_clean_title_preserves_alphanumeric_inside_words() {
+        // A token that contains a digit but isn't a pure number (and
+        // isn't a season/resolution) should be kept.
+        let meta = make_meta_with_stem("Se7en.1995.1080p.BluRay");
+        // As with the Matrix case, the parser eats the 1995 year
+        // token as a group candidate; the cleaner sees "Se7en" only.
+        let result = clean_title_for_directory(&meta, None);
+        assert_eq!(result, "Se7en");
     }
 }

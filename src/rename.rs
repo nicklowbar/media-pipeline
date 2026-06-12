@@ -430,7 +430,7 @@ pub async fn rename_directory(
     dir_id: i64,
     detected_policy: Option<&DetectedPolicy>,
     lookup: &dyn MetadataLookup,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<crate::metadata::CanonicalTitle>> {
     let group_name = config.group_name();
     let will_change_codec = detected_policy.map(|p| p.changes_codec()).unwrap_or(false);
 
@@ -454,7 +454,10 @@ pub async fn rename_directory(
 
     // Best-effort metadata lookup for the primary video. A failure
     // here does not fail the rename; the directory-level rename
-    // continues using the locally-parsed title.
+    // continues using the locally-parsed title. The resolved
+    // canonical title (if any) is returned so the move step can use
+    // it to choose the library layout path.
+    let mut canonical_title: Option<crate::metadata::CanonicalTitle> = None;
     if let Some((primary_full, _)) = primary_video {
         if let Some(basename) = primary_full.file_name().and_then(|n| n.to_str()) {
             let meta = parse_release_metadata(basename);
@@ -466,6 +469,7 @@ pub async fn rename_directory(
                         external_id = %canonical.external_id,
                         "resolved canonical title"
                     );
+                    canonical_title = Some(canonical);
                 }
                 Ok(None) => {
                     debug!(basename, "no canonical title found");
@@ -539,7 +543,7 @@ pub async fn rename_directory(
     }
 
     info!(dir_id, count = rename_map.len(), "directory renamed");
-    Ok(())
+    Ok(canonical_title)
 }
 
 /// Rename a single file. Uses the structured parser to find the group,
@@ -656,6 +660,29 @@ fn is_video_file(path: &Path) -> bool {
     } else {
         false
     }
+}
+
+/// Find the primary video file in a staging directory. Returns the
+/// first video file sitting at the root of the directory — the same
+/// heuristic `rename_directory` uses. This is exposed so the move
+/// step can re-parse the filename to derive a local title for the
+/// library layout resolver when no TMDB canonical is available.
+pub fn primary_video_path(staging_path: &Path) -> Option<PathBuf> {
+    use walkdir::WalkDir;
+    for entry in WalkDir::new(staging_path).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(staging_path)
+            .unwrap_or(entry.path());
+        // Root-level only — first hit wins (directory iteration order).
+        if rel.parent() == Some(Path::new("")) && is_video_file(entry.path()) {
+            return Some(entry.path().to_path_buf());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1284,6 +1311,8 @@ mod tests {
             &lookup,
         ).await;
         assert!(result.is_ok(), "rename_directory failed: {:?}", result.err());
+        // The MockLookup is empty, so no canonical title is returned.
+        assert!(result.unwrap().is_none());
 
         // The video file was actually renamed.
         let renamed = staging.join("Shoresy.S05E03.1080p.HEVC.x265-REPACK.mkv");
@@ -1323,8 +1352,63 @@ mod tests {
             &noop,
         ).await;
         assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "noop lookup returns no canonical");
 
         let renamed = staging.join("Shoresy.S05E03.1080p.HEVC.x265-REPACK.mkv");
         assert!(renamed.exists());
+    }
+
+    #[tokio::test]
+    async fn test_rename_directory_returns_canonical_when_lookup_hits() {
+        // MockLookup returns a CanonicalTitle for the parsed key;
+        // rename_directory should surface it so the move step can
+        // use it for the library layout.
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().to_path_buf();
+        let video = staging.join("Shoresy.S05E03.1080p.HEVC.x265-MeGusta.mkv");
+        std::fs::write(&video, b"fake").unwrap();
+
+        let db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_directory(
+            "tvshows",
+            staging.to_string_lossy().as_ref(),
+            "staging-original",
+            "abc123",
+        ).unwrap();
+        let dir = db.get_directory_by_id(1).unwrap().unwrap();
+        let dir_id = dir.id;
+
+        let config = make_test_config(&tmp, &PathBuf::from(":memory:"));
+
+        // MockLookup returns a canonical for the without_group key.
+        // After the parser strips the group `MeGusta`, the without_group
+        // is `Shoresy.S05E03.1080p.HEVC.x265-` (the trailing separator
+        // before the group is preserved as part of the stem). We
+        // register against that exact key.
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            "tvshows|Shoresy.S05E03.1080p.HEVC.x265-".to_string(),
+            crate::metadata::CanonicalTitle {
+                title: "Shoresy".to_string(),
+                year: Some(2022),
+                external_id: "tt14058038".to_string(),
+                season_count: Some(5),
+            },
+        );
+        let lookup = MockLookup::new(entries);
+        let result = rename_directory(
+            &staging,
+            &config,
+            "tvshows",
+            &db,
+            dir_id,
+            None,
+            &lookup,
+        ).await;
+        let canonical = result.expect("rename should succeed");
+        let canonical = canonical.expect("mock lookup returns a canonical");
+        assert_eq!(canonical.title, "Shoresy");
+        assert_eq!(canonical.year, Some(2022));
+        assert_eq!(canonical.external_id, "tt14058038");
     }
 }

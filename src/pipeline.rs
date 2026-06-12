@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +9,8 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db::{Database, DirectoryState};
 use crate::library;
-use crate::metadata::{CachedLookup, HttpLookup, MetadataLookup, NoopLookup};
+use crate::layout;
+use crate::metadata::{clean_title_for_directory, CachedLookup, HttpLookup, MetadataLookup, NoopLookup};
 use crate::plex;
 use crate::policy::DetectedPolicy;
 use crate::rename;
@@ -78,14 +80,18 @@ pub async fn run_process(config: &Config, db: &Database) -> anyhow::Result<()> {
     // 1. Analyze
     analyze_directories(config, db).await?;
 
-    // 2. Rename
-    rename_directories(config, db, lookup.as_ref()).await?;
+    // 2. Rename. Returns a map of `dir_id -> Option<CanonicalTitle>`
+    //    so the move step can use the resolved title (if any) to
+    //    pick the library layout path.
+    let canonical_titles = rename_directories(config, db, lookup.as_ref()).await?;
 
     // 3. Transcode
     transcode_directories(config, db).await?;
 
-    // 4. Move to library
-    move_to_library(config, db)?;
+    // 4. Move to library. The canonical map is consumed here; if
+    //    a title isn't in the map, we fall back to the locally-
+    //    parsed title.
+    move_to_library(config, db, &canonical_titles)?;
 
     // 5. Plex scan
     trigger_plex_scans(config, db).await?;
@@ -121,9 +127,15 @@ async fn analyze_directories(config: &Config, db: &Database) -> anyhow::Result<(
     Ok(())
 }
 
-async fn rename_directories(config: &Config, db: &Database, lookup: &dyn MetadataLookup) -> anyhow::Result<()> {
+async fn rename_directories(
+    config: &Config,
+    db: &Database,
+    lookup: &dyn MetadataLookup,
+) -> anyhow::Result<HashMap<i64, Option<crate::metadata::CanonicalTitle>>> {
     let dirs = db.get_directories_in_state(DirectoryState::Analyzed)?;
     info!(count = dirs.len(), "directories to rename");
+
+    let mut canonicals: HashMap<i64, Option<crate::metadata::CanonicalTitle>> = HashMap::new();
 
     for dir in dirs {
         let staging_path = Path::new(&dir.staging_path);
@@ -143,7 +155,8 @@ async fn rename_directories(config: &Config, db: &Database, lookup: &dyn Metadat
             detected_policy.as_ref(),
             lookup,
         ).await {
-            Ok(()) => {
+            Ok(canonical) => {
+                canonicals.insert(dir.id, canonical);
                 db.set_directory_state(dir.id, DirectoryState::Renamed)?;
                 info!(dir_id = dir.id, "rename complete");
             }
@@ -154,7 +167,7 @@ async fn rename_directories(config: &Config, db: &Database, lookup: &dyn Metadat
         }
     }
 
-    Ok(())
+    Ok(canonicals)
 }
 
 async fn transcode_directories(config: &Config, db: &Database) -> anyhow::Result<()> {
@@ -192,19 +205,66 @@ async fn transcode_directories(config: &Config, db: &Database) -> anyhow::Result
     Ok(())
 }
 
-fn move_to_library(config: &Config, db: &Database) -> anyhow::Result<()> {
+fn move_to_library(
+    config: &Config,
+    db: &Database,
+    canonical_titles: &HashMap<i64, Option<crate::metadata::CanonicalTitle>>,
+) -> anyhow::Result<()> {
     let dirs = db.get_directories_in_state(DirectoryState::Transcoded)?;
     info!(count = dirs.len(), "directories to move");
 
     for dir in dirs {
         let staging_path = Path::new(&dir.staging_path);
-        let library_dir = config.library_path(&dir.category);
+        let staging_basename = staging_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
-        info!(dir_id = dir.id, src = %staging_path.display(), dst = %library_dir.display(), "moving to library");
+        // Resolve the final library path. The cleaned title comes
+        // from the canonical lookup (TMDB) if available, otherwise
+        // from re-parsing the primary video file. Year is from
+        // TMDB only — we don't trust the filename.
+        let canonical = canonical_titles.get(&dir.id).and_then(|c| c.as_ref());
+        let (title, year) = match canonical {
+            Some(c) => (c.title.clone(), c.year),
+            None => {
+                // Re-parse the primary video to derive a local title.
+                // The parser is pure and the primary file is still
+                // in the staging dir at this point.
+                let primary = rename::primary_video_path(staging_path);
+                match primary
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(rename::parse_release_metadata)
+                {
+                    Some(meta) => {
+                        let cleaned = clean_title_for_directory(&meta, None);
+                        (cleaned, None)
+                    }
+                    None => (staging_basename.clone(), None),
+                }
+            }
+        };
+
+        let final_library_path = layout::resolve_library_path(
+            config,
+            &dir.category,
+            &staging_basename,
+            &title,
+            year,
+        );
+
+        info!(
+            dir_id = dir.id,
+            src = %staging_path.display(),
+            dst = %final_library_path.display(),
+            "moving to library"
+        );
 
         db.set_directory_state(dir.id, DirectoryState::Moving)?;
 
-        match library::move_to_library(staging_path, &library_dir, db, dir.id) {
+        match library::move_to_library(staging_path, &final_library_path, db, dir.id) {
             Ok(library_path) => {
                 db.set_directory_library_path(dir.id, &library_path.to_string_lossy())?;
                 db.set_directory_state(dir.id, DirectoryState::InLibrary)?;
@@ -261,4 +321,153 @@ pub fn print_status(db: &Database) -> anyhow::Result<()> {
         println!("  {:<20} {:>4}", state, count);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CategoryConfig, Config, DatabaseConfig, MetadataConfig, PathsConfig, PlexConfig, SshConfig};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    /// Build a `Config` with a single movies category, a temp staging
+    /// base, and a temp library base. Other categories are absent
+    /// so `library_path("tvshows")` etc. would panic if called.
+    fn make_test_config(staging: &PathBuf, library: &PathBuf) -> Config {
+        let mut categories = HashMap::new();
+        categories.insert(
+            "movies".to_string(),
+            CategoryConfig {
+                remote_dir: "movies".to_string(),
+                library_folder: "Movies".to_string(),
+                transcode_policy: None,
+                plex_section: None,
+            },
+        );
+        Config {
+            ssh: SshConfig {
+                host: "test".to_string(),
+                user: "test".to_string(),
+                private_key_path: PathBuf::from("/dev/null"),
+                remote_base_path: PathBuf::from("/tmp"),
+            },
+            database: DatabaseConfig {
+                path: PathBuf::from(":memory:"),
+            },
+            paths: PathsConfig {
+                staging: staging.clone(),
+                library: library.clone(),
+            },
+            plex: PlexConfig {
+                url: "http://test:32400".to_string(),
+                sections: HashMap::new(),
+            },
+            logging: None,
+            group_name: Some("REPACK".to_string()),
+            categories,
+            metadata: MetadataConfig::default(),
+        }
+    }
+
+    /// End-to-end test of the layout wiring: a staging dir with a
+    /// noisy release name gets renamed by `rename_directory`, and
+    /// then `move_to_library` uses the layout resolver to pick a
+    /// clean directory name (`<Title>/`) under the library.
+    ///
+    /// The NoopLookup is used, so the canonical title is None and
+    /// the resolver falls back to the local-parse path. The
+    /// expected outcome is the staging dir lands at
+    /// `<library>/Movies/Shoresy/`.
+    #[test]
+    fn test_move_to_library_uses_layout_resolver() {
+        let tmp = tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let library = tmp.path().join("library");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(library.join("Movies")).unwrap();
+
+        // Drop a noisy release file in the staging dir.
+        let video = staging.join("Shoresy.S05E03.1080p.HEVC.x265-MeGusta.mkv");
+        std::fs::write(&video, b"fake video data").unwrap();
+
+        // Register the directory as having been renamed (state =
+        // Transcoded) so `move_to_library` picks it up.
+        let db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_directory(
+            "movies",
+            staging.to_string_lossy().as_ref(),
+            staging.to_string_lossy().as_ref(),
+            "abc123",
+        ).unwrap();
+        let dir_id = db.get_directory_by_id(1).unwrap().unwrap().id;
+        db.set_directory_state(dir_id, DirectoryState::Transcoded).unwrap();
+
+        let config = make_test_config(&staging, &library);
+
+        // No canonical titles — the local-parse path picks the dir name.
+        let canonicals: HashMap<i64, Option<crate::metadata::CanonicalTitle>> = HashMap::new();
+        move_to_library(&config, &db, &canonicals).unwrap();
+
+        // The directory landed at <library>/Movies/Shoresy/, not at
+        // <library>/Movies/Shoresy.S05E03.1080p.HEVC.x265-REPACK/.
+        // The file inside is still the original release name — this
+        // test only exercises the move step, not rename.
+        let expected = library.join("Movies").join("Shoresy");
+        assert!(
+            expected.exists(),
+            "expected dir at {:?} but it doesn't exist; library contents: {:?}",
+            expected,
+            std::fs::read_dir(library.join("Movies")).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+        assert!(expected.join("Shoresy.S05E03.1080p.HEVC.x265-MeGusta.mkv").exists());
+    }
+
+    /// When the canonical title is present in the map, it overrides
+    /// the local-parse fallback. The library dir uses the canonical
+    /// title (and year for the collision chain).
+    #[test]
+    fn test_move_to_library_uses_canonical_title() {
+        let tmp = tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let library = tmp.path().join("library");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(library.join("Movies")).unwrap();
+
+        let video = staging.join("Some.Noisy.Release.Name.2024-GROUP.mkv");
+        std::fs::write(&video, b"fake").unwrap();
+
+        let db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_directory(
+            "movies",
+            staging.to_string_lossy().as_ref(),
+            staging.to_string_lossy().as_ref(),
+            "abc123",
+        ).unwrap();
+        let dir_id = db.get_directory_by_id(1).unwrap().unwrap().id;
+        db.set_directory_state(dir_id, DirectoryState::Transcoded).unwrap();
+
+        let config = make_test_config(&staging, &library);
+
+        // Canonical title present — should win over the local parse.
+        let mut canonicals: HashMap<i64, Option<crate::metadata::CanonicalTitle>> = HashMap::new();
+        canonicals.insert(
+            dir_id,
+            Some(crate::metadata::CanonicalTitle {
+                title: "The Actual Movie".to_string(),
+                year: Some(2024),
+                external_id: "tt12345".to_string(),
+                season_count: None,
+            }),
+        );
+        move_to_library(&config, &db, &canonicals).unwrap();
+
+        let expected = library.join("Movies").join("The Actual Movie");
+        assert!(
+            expected.exists(),
+            "expected dir at {:?} but it doesn't exist; library contents: {:?}",
+            expected,
+            std::fs::read_dir(library.join("Movies")).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
 }

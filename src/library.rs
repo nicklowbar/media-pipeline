@@ -1,27 +1,31 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::db::Database;
 
-/// Atomically move a fully processed directory from staging to the live library.
+/// Atomically move a fully processed directory from staging to the
+/// live library.
+///
+/// The caller is responsible for resolving the final library path
+/// (via `layout::resolve_library_path`) and passing it as
+/// `final_library_path`. This function does NOT decide where the
+/// directory lands — that's a layout concern. It only handles the
+/// move mechanics plus the content-hash dedup that protects
+/// against "same content, different name" cases (e.g. a user moved
+/// a directory manually).
 ///
 /// Returns the final library path on success.
 pub fn move_to_library(
     staging_path: &Path,
-    library_base: &Path,
+    final_library_path: &Path,
     db: &Database,
     dir_id: i64,
 ) -> anyhow::Result<PathBuf> {
-    let dir_name = staging_path
-        .file_name()
-        .ok_or_else(|| anyhow!("staging path has no directory name"))?
-        .to_string_lossy();
-
-    let library_path = library_base.join(&*dir_name);
+    let library_path = final_library_path;
 
     // Conflict handling
     if library_path.exists() {
@@ -32,22 +36,36 @@ pub fn move_to_library(
         );
 
         let staging_hash = compute_dir_manifest_hash(staging_path)?;
-        let library_hash = compute_dir_manifest_hash(&library_path)?;
+        let library_hash = compute_dir_manifest_hash(library_path)?;
 
         if staging_hash == library_hash {
             info!("directories are identical, removing staging duplicate");
             std::fs::remove_dir_all(staging_path)
                 .with_context(|| format!("failed to remove staging duplicate {}", staging_path.display()))?;
-            return Ok(library_path);
+            return Ok(library_path.to_path_buf());
         } else {
             warn!("directories differ, backing up existing and replacing");
+            // Derive a backup name from the destination's basename.
+            // The collision chain in layout::resolve_destination
+            // already produced a unique leaf (Title, Title (Year),
+            // Title N, …) so a timestamp suffix is sufficient to
+            // distinguish the backup from the new arrival.
+            let dir_name = library_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "library".to_string());
             let backup_name = format!(
                 "{}.old.{}",
                 dir_name,
                 chrono::Local::now().format("%Y%m%d%H%M%S")
             );
-            let backup_path = library_base.join(&backup_name);
-            std::fs::rename(&library_path, &backup_path)
+            // The backup lives next to the destination. Its parent
+            // is the library category folder, e.g. `/library/Movies`.
+            let backup_path = library_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&backup_name);
+            std::fs::rename(library_path, &backup_path)
                 .with_context(|| format!(
                     "failed to backup existing library directory {} to {}",
                     library_path.display(),
@@ -64,7 +82,7 @@ pub fn move_to_library(
 
     // Atomic rename (same filesystem = fast atomic move)
     debug!(src = %staging_path.display(), dst = %library_path.display(), "performing atomic rename");
-    std::fs::rename(staging_path, &library_path)
+    std::fs::rename(staging_path, library_path)
         .with_context(|| format!(
             "failed to rename {} to {}",
             staging_path.display(),
@@ -72,7 +90,7 @@ pub fn move_to_library(
         ))?;
 
     info!(path = %library_path.display(), "directory moved to library");
-    Ok(library_path)
+    Ok(library_path.to_path_buf())
 }
 
 /// Compute a manifest hash for a local directory (same logic as remote).
@@ -116,7 +134,10 @@ mod tests {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.upsert_directory("tvshows", "/remote", &staging.to_string_lossy(), "hash").unwrap();
 
-        let result = move_to_library(&staging, &library, &db, 1).unwrap();
+        // Pre-resolve the final library path (in production this
+        // happens in `layout::resolve_library_path`).
+        let final_path = library.join("MyShow");
+        let result = move_to_library(&staging, &final_path, &db, 1).unwrap();
         assert_eq!(result, library.join("MyShow"));
         assert!(library.join("MyShow/episode.mkv").exists());
         assert!(!staging.exists());
@@ -138,7 +159,8 @@ mod tests {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.upsert_directory("tvshows", "/remote", &staging.to_string_lossy(), "hash").unwrap();
 
-        let result = move_to_library(&staging, &library, &db, 1).unwrap();
+        let final_path = library.join("MyShow");
+        let result = move_to_library(&staging, &final_path, &db, 1).unwrap();
         assert_eq!(result, existing);
         assert!(existing.join("episode.mkv").exists());
         // Staging should be removed since it's a duplicate
@@ -162,7 +184,8 @@ mod tests {
         let db = Database::open(Path::new(":memory:")).unwrap();
         db.upsert_directory("tvshows", "/remote", &staging.to_string_lossy(), "hash").unwrap();
 
-        let result = move_to_library(&staging, &library, &db, 1).unwrap();
+        let final_path = library.join("MyShow");
+        let result = move_to_library(&staging, &final_path, &db, 1).unwrap();
         assert_eq!(result, existing);
         // Staging moved to library, existing backed up
         assert!(existing.join("episode.mkv").exists());
