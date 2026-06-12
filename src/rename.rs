@@ -1246,6 +1246,7 @@ mod tests {
         Config {
             ssh: crate::config::SshConfig {
                 host: "test".to_string(),
+                port: None,
                 user: "test".to_string(),
                 private_key_path: PathBuf::from("/dev/null"),
                 remote_base_path: PathBuf::from("/tmp"),

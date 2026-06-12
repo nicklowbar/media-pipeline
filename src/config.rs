@@ -15,6 +15,7 @@ use serde::Deserialize;
 ///   3. In-code default (where applicable)
 pub mod env {
     pub const SSH_HOST: &str = "MEDIA_PIPELINE_SSH_HOST";
+    pub const SSH_PORT: &str = "MEDIA_PIPELINE_SSH_PORT";
     pub const SSH_USER: &str = "MEDIA_PIPELINE_SSH_USER";
     pub const SSH_KEY: &str = "MEDIA_PIPELINE_SSH_KEY";
     pub const SSH_REMOTE_BASE: &str = "MEDIA_PIPELINE_SSH_REMOTE_BASE";
@@ -22,7 +23,14 @@ pub mod env {
     pub const STAGING: &str = "MEDIA_PIPELINE_STAGING";
     pub const LIBRARY: &str = "MEDIA_PIPELINE_LIBRARY";
     pub const PLEX_URL: &str = "MEDIA_PIPELINE_PLEX_URL";
+    pub const PLEX_TOKEN: &str = "MEDIA_PIPELINE_PLEX_TOKEN";
     pub const TMDB_API_KEY: &str = "MEDIA_PIPELINE_TMDB_API_KEY";
+    /// Override for the tracing-subscriber EnvFilter directive (e.g.
+    /// "info", "debug", "media_pipeline=debug,reqwest=warn"). When
+    /// unset, the binary defaults to "info" so the app is observably
+    /// chatty out of the box — `tracing-subscriber`'s default is
+    /// `error` only, which produces empty logs.
+    pub const LOG_LEVEL: &str = "MEDIA_PIPELINE_LOG_LEVEL";
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +53,10 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SshConfig {
     pub host: String,
+    /// TCP port for the SSH server. Optional — defaults to 22 when
+    /// unset (i.e. omitted from the TOML or empty in the env var).
+    #[serde(default)]
+    pub port: Option<u16>,
     pub user: String,
     pub private_key_path: PathBuf,
     pub remote_base_path: PathBuf,
@@ -166,6 +178,7 @@ impl Config {
     /// the same precedence either way.
     pub fn apply_env_overrides(&mut self) {
         apply_env_string(&mut self.ssh.host, env::SSH_HOST);
+        apply_env_u16(&mut self.ssh.port, env::SSH_PORT);
         apply_env_string(&mut self.ssh.user, env::SSH_USER);
         apply_env_path(&mut self.ssh.private_key_path, env::SSH_KEY);
         apply_env_path(&mut self.ssh.remote_base_path, env::SSH_REMOTE_BASE);
@@ -174,6 +187,15 @@ impl Config {
         apply_env_path(&mut self.paths.library, env::LIBRARY);
         apply_env_string(&mut self.plex.url, env::PLEX_URL);
         apply_env_string(&mut self.metadata.tmdb_api_key, env::TMDB_API_KEY);
+        // Logging level: materialise a [logging] section if the env
+        // var is set. Empty value falls through to TOML.
+        if let Ok(value) = std::env::var(env::LOG_LEVEL) {
+            if !value.is_empty() {
+                self.logging = Some(LoggingConfig {
+                    level: Some(value),
+                });
+            }
+        }
     }
 
     /// Convenience: load the config file and apply env-var overrides
@@ -199,6 +221,17 @@ impl Config {
     pub fn group_name(&self) -> &str {
         self.group_name.as_deref().unwrap_or("REPACK")
     }
+
+    /// Resolved tracing-subscriber directive. TOML `[logging].level`
+    /// wins, falls back to `"info"` so the app logs out of the box
+    /// — `tracing-subscriber`'s default is `error` only, which
+    /// silently drops every `info!` call and produces empty logs.
+    pub fn log_level(&self) -> &str {
+        self.logging
+            .as_ref()
+            .and_then(|l| l.level.as_deref())
+            .unwrap_or("info")
+    }
 }
 
 /// If the named env var is set and non-empty, replace `target` with
@@ -219,6 +252,19 @@ fn apply_env_path(target: &mut PathBuf, var: &str) {
     if let Ok(value) = std::env::var(var) {
         if !value.is_empty() {
             *target = PathBuf::from(value);
+        }
+    }
+}
+
+/// u16-flavored version of `apply_env_string`. Same empty-string
+/// guard; values that don't parse as `u16` are ignored (typo
+/// guarding: a bad value shouldn't override a good TOML one).
+fn apply_env_u16(target: &mut Option<u16>, var: &str) {
+    if let Ok(value) = std::env::var(var) {
+        if !value.is_empty() {
+            if let Ok(parsed) = value.parse::<u16>() {
+                *target = Some(parsed);
+            }
         }
     }
 }
@@ -369,6 +415,122 @@ library_folder = "Movies"
         let temp = create_temp_config(toml);
         let config = Config::load(temp.path()).unwrap();
         assert_eq!(config.group_name(), "REPACK");
+    }
+
+    #[test]
+    fn test_ssh_port_defaults_to_none() {
+        // No `port` field in [ssh] -> None; consumer falls back to 22.
+        let toml = r#"
+[ssh]
+host = "downloads.example.com"
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+[plex]
+url = "http://plex:32400"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+"#;
+        let temp = create_temp_config(toml);
+        let config = Config::load(temp.path()).unwrap();
+        assert_eq!(config.ssh.port, None);
+    }
+
+    #[test]
+    fn test_ssh_port_from_toml() {
+        let toml = r#"
+[ssh]
+host = "downloads.example.com"
+port = 2222
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+[plex]
+url = "http://plex:32400"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+"#;
+        let temp = create_temp_config(toml);
+        let config = Config::load(temp.path()).unwrap();
+        assert_eq!(config.ssh.port, Some(2222));
+    }
+
+    #[test]
+    fn test_ssh_port_env_override() {
+        let _env = ENV_LOCK.lock().unwrap();
+        // Same precedence as every other overridable field: env var
+        // wins when set, empty / unset / unparseable -> TOML value
+        // (or None) stands.
+        let var = env::SSH_PORT;
+
+        let toml = r#"
+[ssh]
+host = "downloads.example.com"
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+[plex]
+url = "http://plex:32400"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+"#;
+        let temp = create_temp_config(toml);
+
+        // Env var unset -> None.
+        std::env::remove_var(var);
+        let mut config = Config::load(temp.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.ssh.port, None);
+
+        // Env var set -> Some(N).
+        std::env::set_var(var, "2222");
+        let mut config = Config::load(temp.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.ssh.port, Some(2222));
+
+        // Empty env var -> None (empty-string guard).
+        std::env::set_var(var, "");
+        let mut config = Config::load(temp.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.ssh.port, None);
+
+        // Unparseable env var -> None (typo guard, doesn't override).
+        std::env::set_var(var, "twenty-two");
+        let mut config = Config::load(temp.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.ssh.port, None);
+
+        std::env::remove_var(var);
     }
 
     #[test]
@@ -533,6 +695,124 @@ library_folder = "Movies"
         config.apply_env_overrides();
         assert_eq!(config.metadata.tmdb_api_key, "env-key");
         std::env::remove_var(env::TMDB_API_KEY);
+    }
+
+    #[test]
+    fn test_log_level_defaults_to_info() {
+        // No [logging] section -> "info" (not error). The error
+        // default would silently drop every info! call, which is
+        // exactly the bug this defaults to fixing.
+        let toml = r#"
+[ssh]
+host = "downloads.example.com"
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+[plex]
+url = "http://plex:32400"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+"#;
+        let temp = create_temp_config(toml);
+        let config = Config::load(temp.path()).unwrap();
+        assert_eq!(config.log_level(), "info");
+    }
+
+    #[test]
+    fn test_log_level_from_toml() {
+        let toml = r#"
+[ssh]
+host = "downloads.example.com"
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+[plex]
+url = "http://plex:32400"
+
+[logging]
+level = "debug"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+"#;
+        let temp = create_temp_config(toml);
+        let config = Config::load(temp.path()).unwrap();
+        assert_eq!(config.log_level(), "debug");
+    }
+
+    #[test]
+    fn test_log_level_env_override() {
+        let _env = ENV_LOCK.lock().unwrap();
+        // MEDIA_PIPELINE_LOG_LEVEL wins over the TOML value, same
+        // precedence as every other overridable field. Empty /
+        // unset / unparseable values leave the TOML (or default)
+        // in place — typo guard.
+        let var = env::LOG_LEVEL;
+
+        let toml = r#"
+[ssh]
+host = "downloads.example.com"
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+[plex]
+url = "http://plex:32400"
+
+[logging]
+level = "warn"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+"#;
+        let temp = create_temp_config(toml);
+
+        // Env var unset -> TOML value.
+        std::env::remove_var(var);
+        let mut config = Config::load(temp.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.log_level(), "warn");
+
+        // Env var set -> override wins.
+        std::env::set_var(var, "debug,reqwest=warn");
+        let mut config = Config::load(temp.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.log_level(), "debug,reqwest=warn");
+
+        // Empty env var -> TOML value stands.
+        std::env::set_var(var, "");
+        let mut config = Config::load(temp.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.log_level(), "warn");
+
+        std::env::remove_var(var);
     }
 
     #[test]

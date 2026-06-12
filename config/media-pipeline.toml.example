@@ -7,6 +7,7 @@
 #
 # Stable env-var names (defined in src/config.rs::env):
 #   MEDIA_PIPELINE_SSH_HOST         overrides [ssh].host
+#   MEDIA_PIPELINE_SSH_PORT         overrides [ssh].port (defaults to 22)
 #   MEDIA_PIPELINE_SSH_USER         overrides [ssh].user
 #   MEDIA_PIPELINE_SSH_KEY          overrides [ssh].private_key_path
 #   MEDIA_PIPELINE_SSH_REMOTE_BASE  overrides [ssh].remote_base_path
@@ -14,7 +15,10 @@
 #   MEDIA_PIPELINE_STAGING          overrides [paths].staging
 #   MEDIA_PIPELINE_LIBRARY          overrides [paths].library
 #   MEDIA_PIPELINE_PLEX_URL         overrides [plex].url
+#   MEDIA_PIPELINE_PLEX_TOKEN        Plex API token (read directly by the
+#                                    binary; no matching TOML field)
 #   MEDIA_PIPELINE_TMDB_API_KEY     overrides [metadata].tmdb_api_key
+#   MEDIA_PIPELINE_LOG_LEVEL        overrides [logging].level
 #
 # This file is shipped inside the container at /etc/media-pipeline/config.toml
 # and is the source of truth for the pipeline's *structure* (categories,
@@ -23,6 +27,7 @@
 
 [ssh]
 host = "downloads.example.com"
+# port = 22  # optional, defaults to 22
 user = "mediapipe"
 private_key_path = "/root/.ssh/id_rsa"
 remote_base_path = "/srv/data/media"
@@ -37,6 +42,13 @@ library = "/library"
 # Release group name used when renaming files. Replaces the original
 # uploader group in filenames. Defaults to "REPACK" if omitted.
 group_name = "REPACK"
+
+# Tracing-subscriber filter directive. Accepts the standard
+# "level" form ("trace", "debug", "info", "warn", "error") or a
+# per-crate override like "media_pipeline=debug,reqwest=warn".
+# Defaults to "info" when the section is omitted.
+[logging]
+# level = "info"
 
 [plex]
 url = "http://plex:32400"
@@ -99,4 +111,3 @@ library_folder = "Erotic"
 [categories.games]
 remote_dir = "games"
 library_folder = "Games"
-plex_section = null

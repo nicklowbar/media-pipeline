@@ -94,11 +94,12 @@ impl SyncEngine {
 
         let handler = ClientHandler;
 
-        info!(host = %config.ssh.host, user = %config.ssh.user, "connecting to ssh");
+        let port = config.ssh.port.unwrap_or(22);
+        info!(host = %config.ssh.host, port, user = %config.ssh.user, "connecting to ssh");
 
-        let mut session = client::connect(ssh_config, (config.ssh.host.as_str(), 22u16), handler)
+        let mut session = client::connect(ssh_config, (config.ssh.host.as_str(), port), handler)
             .await
-            .with_context(|| format!("failed to connect to {}:22", config.ssh.host))?;
+            .with_context(|| format!("failed to connect to {}:{}", config.ssh.host, port))?;
 
         let key_pair = russh::keys::load_secret_key(&config.ssh.private_key_path,
             None,

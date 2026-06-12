@@ -50,17 +50,31 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing (journald-compatible if available)
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
-
-    info!("media-pipeline starting");
-
+    // Parse the config first so we can pick up the log level. The
+    // config is the single source of truth for log verbosity; the
+    // env var MEDIA_PIPELINE_LOG_LEVEL (applied during
+    // load_with_env) is the container-deploy override.
+    //
+    // Config-load errors are surfaced via anyhow's Display on the
+    // returned Err — that prints to stderr with the `with_context`
+    // message. The tracing subscriber is bootstrapped below, after
+    // we know what level to use.
     let config = Config::load_with_env(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
+
+    // Build the EnvFilter from the resolved level. Falls back to
+    // "info" if the configured value is unparseable (typo guard,
+    // same principle as apply_env_u16).
+    let filter = tracing_subscriber::EnvFilter::try_new(config.log_level())
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .init();
+
+    info!(log_level = %config.log_level(), "media-pipeline starting");
 
     info!(config_path = %cli.config.display(), "config loaded");
 
