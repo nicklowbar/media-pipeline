@@ -81,8 +81,9 @@ games = 7
 # cache_ttl_days = 30
 
 # Categories define where content comes from and where it goes.
-# Transcode policy is determined per-title after sync (via ffprobe).
-# Only set transcode_policy here if you want to force a default for ALL titles in a category.
+# Per-title ffprobe analysis still runs (records codec/resolution
+# to the DB for visibility) but the pipeline no longer transcodes
+# — library-side re-encoding is owned by Tdarr.
 
 [categories.tvshows]
 remote_dir = "tv"

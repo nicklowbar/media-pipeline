@@ -17,7 +17,7 @@ use crate::rename;
 use crate::sync;
 use crate::transcode;
 
-/// Run the full pipeline: sync → analyze → rename → transcode → move → plex scan
+/// Run the full pipeline: sync → analyze → rename → move → plex scan
 pub async fn run_full(config: &Config, db: &Database) -> anyhow::Result<()> {
     run_sync(config, db).await?;
     run_process(config, db).await?;
@@ -66,7 +66,7 @@ pub async fn run_sync(config: &Config, db: &Database) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run only the process phase: analyze → rename → transcode → move → plex scan
+/// Run only the process phase: analyze → rename → move → plex scan
 pub async fn run_process(config: &Config, db: &Database) -> anyhow::Result<()> {
     info!("starting process phase");
 
@@ -85,15 +85,20 @@ pub async fn run_process(config: &Config, db: &Database) -> anyhow::Result<()> {
     //    pick the library layout path.
     let canonical_titles = rename_directories(config, db, lookup.as_ref()).await?;
 
-    // 3. Transcode
-    transcode_directories(config, db).await?;
+    // Note: transcode is intentionally NOT part of `run_process`.
+    // Library-side re-encoding is owned by Tdarr (see
+    // memory/architecture-pipeline-vs-tdarr.md). The transcode
+    // module and the Transcoding/Transcoded state variants stay
+    // in the codebase for the rare case where a future operator
+    // wants to force-re-encode, but they are not invoked on a
+    // normal pipeline run.
 
-    // 4. Move to library. The canonical map is consumed here; if
+    // 3. Move to library. The canonical map is consumed here; if
     //    a title isn't in the map, we fall back to the locally-
     //    parsed title.
     move_to_library(config, db, &canonical_titles)?;
 
-    // 5. Plex scan
+    // 4. Plex scan
     trigger_plex_scans(config, db).await?;
 
     info!("process phase complete");
@@ -170,6 +175,13 @@ async fn rename_directories(
     Ok(canonicals)
 }
 
+/// Standalone transcode pass over directories in the `Renamed`
+/// state. Not invoked from `run_process` — library-side re-encoding
+/// is owned by Tdarr per the architecture decision. Kept here as a
+/// callable for the rare case where a future operator wants to
+/// force-re-encode a batch (e.g. via a `transcode-only` subcommand
+/// or a one-shot script).
+#[allow(dead_code)]
 async fn transcode_directories(config: &Config, db: &Database) -> anyhow::Result<()> {
     let dirs = db.get_directories_in_state(DirectoryState::Renamed)?;
     info!(count = dirs.len(), "directories to transcode");
@@ -210,7 +222,7 @@ fn move_to_library(
     db: &Database,
     canonical_titles: &HashMap<i64, Option<crate::metadata::CanonicalTitle>>,
 ) -> anyhow::Result<()> {
-    let dirs = db.get_directories_in_state(DirectoryState::Transcoded)?;
+    let dirs = db.get_directories_in_state(DirectoryState::Renamed)?;
     info!(count = dirs.len(), "directories to move");
 
     for dir in dirs {
@@ -392,8 +404,8 @@ mod tests {
         let video = staging.join("Shoresy.S05E03.1080p.HEVC.x265-MeGusta.mkv");
         std::fs::write(&video, b"fake video data").unwrap();
 
-        // Register the directory as having been renamed (state =
-        // Transcoded) so `move_to_library` picks it up.
+        // Register the directory as having been renamed so
+        // `move_to_library` picks it up.
         let db = Database::open(std::path::Path::new(":memory:")).unwrap();
         db.upsert_directory(
             "movies",
@@ -402,7 +414,7 @@ mod tests {
             "abc123",
         ).unwrap();
         let dir_id = db.get_directory_by_id(1).unwrap().unwrap().id;
-        db.set_directory_state(dir_id, DirectoryState::Transcoded).unwrap();
+        db.set_directory_state(dir_id, DirectoryState::Renamed).unwrap();
 
         let config = make_test_config(&staging, &library);
 
@@ -446,7 +458,7 @@ mod tests {
             "abc123",
         ).unwrap();
         let dir_id = db.get_directory_by_id(1).unwrap().unwrap().id;
-        db.set_directory_state(dir_id, DirectoryState::Transcoded).unwrap();
+        db.set_directory_state(dir_id, DirectoryState::Renamed).unwrap();
 
         let config = make_test_config(&staging, &library);
 

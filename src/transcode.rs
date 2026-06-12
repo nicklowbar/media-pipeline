@@ -18,6 +18,13 @@ lazy_static::lazy_static! {
 }
 
 /// Transcode all video files in a staging directory according to the detected policy.
+///
+/// Not invoked from the normal `run` path — library-side re-encoding
+/// is owned by Tdarr per the architecture decision
+/// (memory/architecture-pipeline-vs-tdarr.md). Kept here as a
+/// callable for the rare case where a future operator wants to
+/// force-re-encode a batch.
+#[allow(dead_code)]
 pub async fn transcode_directory(
     staging_path: &Path,
     detected_policy: DetectedPolicy,

@@ -1,8 +1,8 @@
 # media-pipeline
 
-Automated media sync, rename, transcode, and ingest pipeline.
+Automated media sync, rename, and ingest pipeline.
 
-Downloads media from a remote host via SSH/SFTP, analyzes it to determine whether transcoding is needed, renames files to a consistent format, transcodes with `ffmpeg`, and moves the result into a Plex/Jellyfin library.
+Downloads media from a remote host via SSH/SFTP, renames files to a consistent format, and moves the result into a Plex/Jellyfin library. Library-side re-encoding (x264 → HEVC, target resolution ladder, format normalization) is handled by [Tdarr](https://home.tdarr.info/) — see `memory/architecture-pipeline-vs-tdarr.md` in the project vault for the split rationale.
 
 ## Features
 
@@ -25,7 +25,6 @@ Docker container (or local)
     ├── Staging volume
     ├── ffprobe analysis → DetectedPolicy
     ├── Rename files (group replacement + codec tag update)
-    ├── ffmpeg transcode (.tmp files, atomic replace)
     └── Atomic move to library mount
     │
     ▼
@@ -35,6 +34,8 @@ Library storage (TrueNAS / NAS / local)
     ├── Music
     └── ...
 ```
+
+The transcode step is deliberately omitted — Tdarr owns library-side re-encoding. See "Library stewardship" below.
 
 ## Quick Start
 
@@ -115,10 +116,18 @@ Every top-level directory is tracked in SQLite:
 
 ```
 detected → syncing → synced → analyzing → analyzed → renaming → renamed
-    → transcoding → transcoded → moving → in_library
+    → moving → in_library
 ```
 
+The `transcoding` and `transcoded` states are part of the schema for historical reasons but are no longer entered on a normal run — see "Library stewardship" below.
+
 Failed states are recoverable: if the remote manifest changes, the record resets to `detected` for reprocessing.
+
+## Library stewardship (Tdarr)
+
+This pipeline drops files into the library as-is. Re-encoding to a target spec (HEVC/x265, the 4K → 1080p → 720p → 480p quality ladder, support for x264 / AVI / DVD-ISO inputs) is handled by [Tdarr](https://home.tdarr.info/), which walks the library periodically and re-encodes anything that doesn't match its configured health check.
+
+Integration is filesystem-only: Tdarr watches the same `/library/` mount the pipeline writes to. No API coupling, no shared DB. The pipeline's `transcode` module and the `Transcoding`/`Transcoded` state variants are kept in the codebase for the rare case where a future operator wants to force-re-encode a batch, but they are not invoked by the normal `run` command.
 
 ## Testing
 
@@ -126,12 +135,12 @@ Failed states are recoverable: if the remote manifest changes, the record resets
 cargo test
 ```
 
-Tests cover config parsing, DB state transitions, rename regex logic, policy selection, transcode codec matching, library move semantics, and Plex URL construction.
+Tests cover config parsing, DB state transitions, rename regex logic, policy selection, library move semantics, and Plex URL construction.
 
 ## Requirements
 
 - Rust 1.78+ (for building from source)
-- `ffmpeg` and `ffprobe` (runtime)
+- `ffprobe` (runtime, for ffprobe analysis)
 - SSH private key for remote host access
 - Plex token (optional, for library scan triggers)
 

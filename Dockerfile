@@ -42,7 +42,8 @@ RUN cargo build --release --bin media-pipeline \
 FROM debian:bookworm-slim AS runtime
 
 # Runtime libs only:
-#   ffmpeg / ffprobe — transcode step
+#   ffmpeg / ffprobe — per-title analysis step (codec/resolution
+#                      probing; transcode is owned by Tdarr)
 #   libssl3 / ca-certificates — russh + reqwest TLS
 #   sqlite3 — bundled rusqlite doesn't need a system lib, but having
 #             the CLI on hand is useful for debugging
