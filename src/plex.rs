@@ -3,17 +3,11 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
-/// Resolve Plex token from environment or file.
+/// Resolve Plex token from the MEDIA_PIPELINE_PLEX_TOKEN env var.
 fn resolve_token() -> anyhow::Result<String> {
-    std::env::var("PLEX_TOKEN")
-        .or_else(|_| {
-            std::env::var("PLEX_TOKEN_FILE")
-                .ok()
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .map(|s| s.trim().to_string())
-                .ok_or_else(|| anyhow::anyhow!("PLEX_TOKEN not set"))
-        })
-        .context("Plex token not found in environment or file")
+    let token = std::env::var(crate::config::env::PLEX_TOKEN)
+        .context("MEDIA_PIPELINE_PLEX_TOKEN not set")?;
+    Ok(token.trim().to_string())
 }
 
 /// Build the Plex refresh URL.
@@ -95,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_resolve_token_missing() {
-        // Both env vars absent -> error.
+        // Env var absent -> error.
         let _injector = hook_env_var("UNUSED_KEY", "unused".to_string());
         let _clear = ClearGuard;
 
@@ -105,8 +99,8 @@ mod tests {
 
     #[test]
     fn test_resolve_token_from_env() {
-        // PLEX_TOKEN set, PLEX_TOKEN_FILE absent -> token comes from PLEX_TOKEN.
-        let _injector = hook_env_var("PLEX_TOKEN", "my-secret-token".to_string());
+        // MEDIA_PIPELINE_PLEX_TOKEN set -> token comes from env.
+        let _injector = hook_env_var("MEDIA_PIPELINE_PLEX_TOKEN", "my-secret-token\n".to_string());
         let _clear = ClearGuard;
 
         let token = resolve_token().unwrap();
@@ -114,17 +108,13 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_token_from_file() {
-        // PLEX_TOKEN absent, PLEX_TOKEN_FILE points to a file with the token.
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(temp.path(), "file-token\n").unwrap();
-        let path = temp.path().to_string_lossy().into_owned();
-
-        let _injector = hook_env_var("PLEX_TOKEN_FILE", path);
+    fn test_resolve_token_trims_whitespace() {
+        // Newlines / spaces around the value are stripped.
+        let _injector = hook_env_var("MEDIA_PIPELINE_PLEX_TOKEN", "  my-token  \n".to_string());
         let _clear = ClearGuard;
 
         let token = resolve_token().unwrap();
-        assert_eq!(token, "file-token");
+        assert_eq!(token, "my-token");
     }
 
     #[test]

@@ -10,8 +10,9 @@ services:
     # either run `usermod -u 1000 <your-user>` or change the uid in
     # the Dockerfile to match.
     user: "1000:1000"
-    # tini (PID 1) handles SIGTERM/SIGINT cleanly so the pipeline
-    # daemon doesn't have to. `restart: no` matches the existing
+    # `init: true` injects a tini-equivalent as PID 1: handles
+    # SIGTERM/SIGINT cleanly and reaps zombie children, so the
+    # pipeline doesn't have to. `restart: no` matches the existing
     # systemd unit - runs are scheduled, not long-lived.
     init: true
     restart: no
@@ -21,17 +22,19 @@ services:
       # MEDIA_PIPELINE_* env var below so the binary finds the data.
       - /mnt/mediaserver:/library
       - /opt/media-pipeline/staging:/staging
-      - /opt/media-pipeline/ssh:/root/.ssh:ro
+      - /opt/media-pipeline/ssh:/ssh:ro
       - /opt/media-pipeline/data:/data
     environment:
-      # Plex auth. The pipeline reads the token from this file so
-      # the secret never appears in `docker inspect` output.
-      - PLEX_TOKEN_FILE=/etc/media-pipeline/.env
+      # Plex auth. The token is passed directly via env var (same
+      # channel as the other host-specific overrides) so the deploy
+      # doesn't depend on a token file inside the image.
+      - MEDIA_PIPELINE_PLEX_TOKEN=${MEDIA_PIPELINE_PLEX_TOKEN}
       # Host-specific overrides. The image is self-sufficient: it
       # bakes a default config.toml with sensible category/section
       # values. Set these to point the binary at your network.
       # Documented in config/media-pipeline.toml.example.
       - MEDIA_PIPELINE_SSH_HOST=${MEDIA_PIPELINE_SSH_HOST}
+      - MEDIA_PIPELINE_SSH_PORT=${MEDIA_PIPELINE_SSH_PORT}
       - MEDIA_PIPELINE_SSH_USER=${MEDIA_PIPELINE_SSH_USER}
       - MEDIA_PIPELINE_SSH_KEY=${MEDIA_PIPELINE_SSH_KEY:-/root/.ssh/id_rsa}
       - MEDIA_PIPELINE_SSH_REMOTE_BASE=${MEDIA_PIPELINE_SSH_REMOTE_BASE}

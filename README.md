@@ -92,7 +92,7 @@ docker run --rm \
   -v /opt/media-pipeline/config:/etc/media-pipeline:ro \
   -v /opt/media-pipeline/ssh:/root/.ssh:ro \
   -v /opt/media-pipeline/data:/data \
-  -e PLEX_TOKEN=your-token-here \
+  -e MEDIA_PIPELINE_PLEX_TOKEN=your-token-here \
   media-pipeline:latest
 ```
 
