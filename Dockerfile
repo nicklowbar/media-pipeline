@@ -44,14 +44,16 @@ FROM debian:bookworm-slim AS runtime
 # Runtime libs only:
 #   ffmpeg / ffprobe — transcode step
 #   libssl3 / ca-certificates — russh + reqwest TLS
-#   tini — PID 1 + signal forwarding
 #   sqlite3 — bundled rusqlite doesn't need a system lib, but having
 #             the CLI on hand is useful for debugging
+#
+# PID 1 / signal-forwarding / zombie-reaping is the daemon's job, and
+# docker-compose's `init: true` injects a tini-equivalent for that.
+# The image stays out of the PID-1 business.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libssl3 \
         ca-certificates \
-        tini \
         sqlite3 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /etc/media-pipeline /staging /library /data
@@ -88,5 +90,9 @@ WORKDIR /home/pipeline
 #   docker run ... media-pipeline status
 #   docker run ... media-pipeline sync-only
 #   docker run ... media-pipeline process-only
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/media-pipeline"]
+#
+# No tini wrapper here: docker-compose's `init: true` injects a
+# tini-equivalent as PID 1, so wrapping the entrypoint with another
+# tini would just produce a "Tini is not running as PID 1" warning.
+ENTRYPOINT ["/usr/local/bin/media-pipeline"]
 CMD ["run", "--config", "/etc/media-pipeline/config.toml"]

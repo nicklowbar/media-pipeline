@@ -23,7 +23,11 @@ use crate::db::Database;
 #[command(name = "media-pipeline")]
 #[command(about = "Automated media sync, rename, transcode, and ingest pipeline")]
 struct Cli {
-    #[arg(short, long, value_name = "FILE", default_value = "/etc/media-pipeline/config.toml")]
+    #[arg(
+        short, long, value_name = "FILE",
+        default_value = "/etc/media-pipeline/config.toml",
+        global = true,
+    )]
     config: PathBuf,
 
     #[command(subcommand)]
