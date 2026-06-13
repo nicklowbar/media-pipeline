@@ -123,7 +123,7 @@ async fn analyze_directories(config: &Config, db: &Database) -> anyhow::Result<(
                 info!(dir_id = dir.id, policy = %policy_str, "analysis complete");
             }
             Err(e) => {
-                db.set_directory_error(dir.id, &format!("analysis failed: {}", e))?;
+                db.set_directory_error(dir.id, DirectoryState::AnalyzeFailed, &format!("analysis failed: {}", e))?;
                 error!(dir_id = dir.id, error = %e, "analysis failed");
             }
         }
@@ -166,7 +166,7 @@ async fn rename_directories(
                 info!(dir_id = dir.id, "rename complete");
             }
             Err(e) => {
-                db.set_directory_error(dir.id, &format!("rename failed: {}", e))?;
+                db.set_directory_error(dir.id, DirectoryState::RenameFailed, &format!("rename failed: {}", e))?;
                 error!(dir_id = dir.id, error = %e, "rename failed");
             }
         }
@@ -208,7 +208,7 @@ async fn transcode_directories(config: &Config, db: &Database) -> anyhow::Result
                 info!(dir_id = dir.id, "transcode complete");
             }
             Err(e) => {
-                db.set_directory_error(dir.id, &format!("transcode failed: {}", e))?;
+                db.set_directory_error(dir.id, DirectoryState::TranscodeFailed, &format!("transcode failed: {}", e))?;
                 error!(dir_id = dir.id, error = %e, "transcode failed");
             }
         }
@@ -283,7 +283,7 @@ fn move_to_library(
                 info!(dir_id = dir.id, path = %library_path.display(), "move complete");
             }
             Err(e) => {
-                db.set_directory_error(dir.id, &format!("move failed: {}", e))?;
+                db.set_directory_error(dir.id, DirectoryState::MoveFailed, &format!("move failed: {}", e))?;
                 error!(dir_id = dir.id, error = %e, "move failed");
             }
         }

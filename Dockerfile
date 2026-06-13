@@ -4,11 +4,6 @@
 #
 # Stage 1 (builder): compiles the release binary from src/main.rs.
 # Stage 2 (runtime): minimal Debian with ffmpeg + the binary.
-#
-# Build cache trick: copy only Cargo.toml/Cargo.lock first and run a
-# dummy build to populate the registry/git crates. Source changes
-# afterwards don't bust the deps layer. The stub src/main.rs is
-# required because `cargo build` needs at least one source file.
 
 # ---------- Build stage ----------
 # Base image is `nightly` because a downstream crate uses the
@@ -23,17 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Deps layer: copy manifests and a placeholder source tree, build, throw
-# away the placeholder. Subsequent builds with only src/ changes reuse this.
-# The stub src/main.rs is required because `cargo build` needs at least
-# one source file to resolve the [[bin]] target.
+# Copy the whole project and build. No stub-cache trick: source changes
+# bust the layer, but the rebuild is the only correct path and the
+# previous stub-cache produced a 301 KB stub binary in the deployed
+# image. Rebuild time is dominated by the first build anyway; for
+# iterative dev work, build outside the container and copy the binary
+# in (see scripts/ if/when we add one).
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src \
-    && echo 'fn main() {}' > src/main.rs \
-    && cargo build --release --bin media-pipeline \
-    && rm -rf src target/release/deps/media-pipeline* target/release/media-pipeline
-
-# Real source: now the actual code gets compiled against the cached deps.
 COPY src ./src
 RUN cargo build --release --bin media-pipeline \
     && strip target/release/media-pipeline

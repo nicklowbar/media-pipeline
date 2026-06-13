@@ -5,20 +5,22 @@ use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{debug, info};
 
+/// State machine for a single directory's progress through the pipeline.
+///
+/// Each phase has a single `*Failed` variant so a directory's last failure
+/// point is preserved (e.g. `MoveFailed` tells the operator the directory
+/// reached the move step and only the move itself broke). The pipeline
+/// retries failed rows on subsequent runs by resetting the state to the
+/// phase's input state in `upsert_directory` — see that function for the
+/// per-phase mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectoryState {
     Detected,
-    Syncing,
-    Synced,
-    Analyzing,
-    Analyzed,
-    Renaming,
-    Renamed,
-    Transcoding,
-    Transcoded,
-    Moving,
-    InLibrary,
-    Failed,
+    Syncing, Synced, SyncingFailed,
+    Analyzing, Analyzed, AnalyzeFailed,
+    Renaming, Renamed, RenameFailed,
+    Transcoding, Transcoded, TranscodeFailed,
+    Moving, InLibrary, MoveFailed,
 }
 
 impl DirectoryState {
@@ -27,15 +29,19 @@ impl DirectoryState {
             DirectoryState::Detected => "detected",
             DirectoryState::Syncing => "syncing",
             DirectoryState::Synced => "synced",
+            DirectoryState::SyncingFailed => "sync_failed",
             DirectoryState::Analyzing => "analyzing",
             DirectoryState::Analyzed => "analyzed",
+            DirectoryState::AnalyzeFailed => "analyze_failed",
             DirectoryState::Renaming => "renaming",
             DirectoryState::Renamed => "renamed",
+            DirectoryState::RenameFailed => "rename_failed",
             DirectoryState::Transcoding => "transcoding",
             DirectoryState::Transcoded => "transcoded",
+            DirectoryState::TranscodeFailed => "transcode_failed",
             DirectoryState::Moving => "moving",
             DirectoryState::InLibrary => "in_library",
-            DirectoryState::Failed => "failed",
+            DirectoryState::MoveFailed => "move_failed",
         }
     }
 
@@ -44,15 +50,19 @@ impl DirectoryState {
             "detected" => Some(DirectoryState::Detected),
             "syncing" => Some(DirectoryState::Syncing),
             "synced" => Some(DirectoryState::Synced),
+            "sync_failed" => Some(DirectoryState::SyncingFailed),
             "analyzing" => Some(DirectoryState::Analyzing),
             "analyzed" => Some(DirectoryState::Analyzed),
+            "analyze_failed" => Some(DirectoryState::AnalyzeFailed),
             "renaming" => Some(DirectoryState::Renaming),
             "renamed" => Some(DirectoryState::Renamed),
+            "rename_failed" => Some(DirectoryState::RenameFailed),
             "transcoding" => Some(DirectoryState::Transcoding),
             "transcoded" => Some(DirectoryState::Transcoded),
+            "transcode_failed" => Some(DirectoryState::TranscodeFailed),
             "moving" => Some(DirectoryState::Moving),
             "in_library" => Some(DirectoryState::InLibrary),
-            "failed" => Some(DirectoryState::Failed),
+            "move_failed" => Some(DirectoryState::MoveFailed),
             _ => None,
         }
     }
@@ -65,6 +75,44 @@ impl DirectoryState {
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<std::sync::Mutex<Connection>>,
+}
+
+/// Returns `true` if the `directories` table exists with the old
+/// single-`failed`-state CHECK constraint and needs to be migrated to
+/// the per-phase failure states. Returns `false` if the table is missing
+/// (no migration needed — the subsequent `CREATE TABLE IF NOT EXISTS`
+/// will install the new schema) or already has the new CHECK.
+fn table_needs_migration(conn: &Connection) -> anyhow::Result<bool> {
+    // PRAGMA table_info returns one row per column. We can't query the
+    // CHECK constraint text directly, so we look for the table by name
+    // and then check the column list — the simplest discriminator
+    // between old and new schema is the absence/presence of the new
+    // per-phase failed states. Since the column list is identical
+    // between schemas, the discriminating test is to look for one of
+    // the new state strings in the saved CREATE TABLE SQL via
+    // sqlite_master. If we can't find the new strings, we migrate.
+    let has_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='directories'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)?;
+    if !has_table {
+        return Ok(false);
+    }
+    let create_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='directories'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = create_sql else { return Ok(true); };
+    // The old schema has the literal 'failed' state in the CHECK list.
+    // The new schema has the per-phase names ('sync_failed', etc.).
+    // If the new names are absent, we need to migrate.
+    Ok(!sql.contains("sync_failed"))
 }
 
 impl Database {
@@ -81,6 +129,61 @@ impl Database {
 
     fn init_schema(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // If the table was created under the old schema (single 'failed'
+        // state), recreate it with the per-phase failure states. SQLite
+        // doesn't support DROP CONSTRAINT, so the only way to widen the
+        // CHECK is to copy the rows into a new table and swap. Any rows
+        // stuck in the old 'failed' bucket are reset to 'detected' so the
+        // pipeline can retry them; this is exactly the recovery the
+        // migration is intended to enable.
+        if table_needs_migration(&conn)? {
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE directories_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category        TEXT NOT NULL,
+                    remote_path     TEXT NOT NULL,
+                    staging_path    TEXT NOT NULL,
+                    library_path    TEXT,
+                    state           TEXT NOT NULL CHECK(state IN (
+                        'detected','syncing','synced','sync_failed',
+                        'analyzing','analyzed','analyze_failed',
+                        'renaming','renamed','rename_failed',
+                        'transcoding','transcoded','transcode_failed',
+                        'moving','in_library','move_failed')),
+                    manifest_hash   TEXT,
+                    detected_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    synced_at       DATETIME,
+                    analyzed_at     DATETIME,
+                    renamed_at      DATETIME,
+                    transcoded_at   DATETIME,
+                    moved_at        DATETIME,
+                    detected_policy TEXT,
+                    plex_scan_at    DATETIME,
+                    error_message   TEXT,
+                    UNIQUE(category, remote_path)
+                );
+                INSERT INTO directories_new
+                    (id, category, remote_path, staging_path, library_path,
+                     state, manifest_hash, detected_at, synced_at, analyzed_at,
+                     renamed_at, transcoded_at, moved_at, detected_policy,
+                     plex_scan_at, error_message)
+                SELECT
+                    id, category, remote_path, staging_path, library_path,
+                    CASE WHEN state = 'failed' THEN 'detected' ELSE state END,
+                    manifest_hash, detected_at, synced_at, analyzed_at,
+                    renamed_at, transcoded_at, moved_at, detected_policy,
+                    plex_scan_at,
+                    CASE WHEN state = 'failed' THEN NULL ELSE error_message END
+                FROM directories;
+                DROP TABLE directories;
+                ALTER TABLE directories_new RENAME TO directories;
+                COMMIT;
+                "#,
+            )?;
+        }
+
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS directories (
@@ -90,11 +193,11 @@ impl Database {
                 staging_path    TEXT NOT NULL,
                 library_path    TEXT,
                 state           TEXT NOT NULL CHECK(state IN (
-                    'detected','syncing','synced',
-                    'analyzing','analyzed',
-                    'renaming','renamed',
-                    'transcoding','transcoded',
-                    'moving','in_library','failed')),
+                    'detected','syncing','synced','sync_failed',
+                    'analyzing','analyzed','analyze_failed',
+                    'renaming','renamed','rename_failed',
+                    'transcoding','transcoded','transcode_failed',
+                    'moving','in_library','move_failed')),
                 manifest_hash   TEXT,
                 detected_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
                 synced_at       DATETIME,
@@ -141,19 +244,60 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_metadata_cache_expires
                 ON metadata_cache(expires_at);
+
+            -- Per-file SHA-256 fingerprints recorded from the remote at
+            -- manifest-collection time. The download path then re-hashes
+            -- each downloaded file locally and compares — a mismatch is
+            -- the only way to catch corruption that lands within the
+            -- expected file size (the final-size check is necessary but
+            -- not sufficient). Keyed on (dir_id, rel_path) so two
+            -- directories with the same internal file name don't collide.
+            -- FK cascade so deleting a directory cleans up its hashes.
+            CREATE TABLE IF NOT EXISTS file_hashes (
+                dir_id           INTEGER NOT NULL REFERENCES directories(id) ON DELETE CASCADE,
+                rel_path         TEXT    NOT NULL,
+                expected_sha256  TEXT    NOT NULL,
+                size             INTEGER NOT NULL,
+                mtime            INTEGER NOT NULL,
+                PRIMARY KEY(dir_id, rel_path)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_file_hashes_dir ON file_hashes(dir_id);
             "#,
         )?;
         Ok(())
     }
 
-    /// Insert a newly-detected directory or update its manifest hash and reset state.
+    /// Insert a newly-detected directory or update its manifest hash and
+    /// reset state.
+    ///
+    /// Reset rules, in priority order:
+    /// 1. If the manifest hash changed, the row is reset to `detected`
+    ///    (new files on the remote) and `error_message` is cleared.
+    /// 2. If the row is currently in a `*Failed` state and the hash
+    ///    matches, the row is reset to the input state of the phase
+    ///    that previously failed (see `reset_state_for_failed`) so the
+    ///    next pipeline run re-attempts the work. This is the recovery
+    ///    path for transient failures (e.g. CIFS permission denied
+    ///    that has since been fixed): the directory stays where it was
+    ///    in the pipeline instead of being treated as fresh, and
+    ///    `error_message` is cleared.
+    /// 3. Otherwise the row is left untouched.
+    ///
+    /// Returns the directory's `id` so callers can chain a follow-up
+    /// write that needs the FK (e.g. `file_hashes`). On the
+    /// `ON CONFLICT` (no-insert) path, `last_insert_rowid()` is not
+    /// meaningful for the existing row, so we look the id up by
+    /// `(category, remote_path)`. Both branches are one extra SELECT
+    /// / no extra round-trip — the whole function holds the conn
+    /// mutex for its duration.
     pub fn upsert_directory(
         &self,
         category: &str,
         remote_path: &str,
         staging_path: &str,
         manifest_hash: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             r#"
@@ -163,20 +307,137 @@ impl Database {
                 manifest_hash = excluded.manifest_hash,
                 state = CASE
                     WHEN directories.manifest_hash != excluded.manifest_hash THEN 'detected'
+                    WHEN directories.state = 'sync_failed'     THEN 'detected'
+                    WHEN directories.state = 'analyze_failed'  THEN 'synced'
+                    WHEN directories.state = 'rename_failed'   THEN 'analyzed'
+                    WHEN directories.state = 'transcode_failed' THEN 'renamed'
+                    WHEN directories.state = 'move_failed'     THEN 'renamed'
                     ELSE directories.state
                 END,
                 detected_at = CASE
                     WHEN directories.manifest_hash != excluded.manifest_hash THEN CURRENT_TIMESTAMP
+                    WHEN directories.state IN (
+                        'sync_failed','analyze_failed','rename_failed',
+                        'transcode_failed','move_failed'
+                    ) THEN CURRENT_TIMESTAMP
                     ELSE directories.detected_at
                 END,
                 error_message = CASE
                     WHEN directories.manifest_hash != excluded.manifest_hash THEN NULL
+                    WHEN directories.state IN (
+                        'sync_failed','analyze_failed','rename_failed',
+                        'transcode_failed','move_failed'
+                    ) THEN NULL
                     ELSE directories.error_message
                 END
             "#,
             params![category, remote_path, staging_path, manifest_hash],
         )?;
+        // Look up the id by (category, remote_path). `last_insert_rowid()`
+        // would also work on the pure-insert path, but it returns a
+        // sqlite-internal value (often the rowid of the most recent
+        // successful insert in the connection) on the ON CONFLICT path,
+        // not the id of the existing row. Looking it up by the unique
+        // key works on both paths and is one row.
+        let id: i64 = conn.query_row(
+            "SELECT id FROM directories WHERE category = ?1 AND remote_path = ?2",
+            params![category, remote_path],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    // ----------------------------------------------------------------------
+    // Per-file SHA-256 fingerprints
+    //
+    // For each directory whose manifest we collect, we run a batch
+    // `sha256sum` on the remote and persist the (rel_path, hash, size,
+    // mtime) tuples here. The download path then re-hashes the local
+    // file and compares — a mismatch is the only way to catch
+    // corruption that lands within the expected file size. The
+    // `size` and `mtime` columns are stored for diagnostic / future
+    // use (e.g. matching against the manifest collected in
+    // `collect_manifest`); the verification step today only reads
+    // `expected_sha256`.
+    //
+    // The functions are designed for the call shape of `sync.rs`:
+    // collect manifest → collect hashes → upsert directory → upsert
+    // file_hashes (with the just-obtained dir_id). The bulk write
+    // replaces the directory's full hash set atomically (one
+    // transaction: DELETE old, INSERT new), so files that disappeared
+    // on the remote don't leave stale rows behind.
+    // ----------------------------------------------------------------------
+
+    /// Replace the entire hash set for a directory. Atomic from the
+    /// caller's perspective: either all rows land or none do. The
+    /// `(String, String, i64, i64)` tuple is `(rel_path, sha256,
+    /// size, mtime)`. A `sha256` of `""` is treated as a deletion
+    /// marker in the parsing layer and is filtered out before
+    /// reaching this call.
+    pub fn upsert_file_hashes(
+        &self,
+        dir_id: i64,
+        hashes: &[(String, String, i64, i64)],
+    ) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // Clear the existing rows for this directory. Re-running the
+        // manifest collection should leave the row set in lock-step
+        // with the SFTP walk; a `REPLACE` per-row wouldn't catch
+        // files that disappeared on the remote.
+        tx.execute(
+            "DELETE FROM file_hashes WHERE dir_id = ?1",
+            params![dir_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO file_hashes (dir_id, rel_path, expected_sha256, size, mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for (rel_path, sha256, size, mtime) in hashes {
+                stmt.execute(params![dir_id, rel_path, sha256, size, mtime])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Look up the expected hash for one file in a directory.
+    /// Returns `Ok(None)` if no row is present (the directory has
+    /// never had its manifest collected, or the file was added after
+    /// the last collection). The verification path treats both
+    /// cases as "skip verification with a WARN" rather than as a
+    /// hard error — the user wants integrity checks to *improve*
+    /// coverage, not block the pipeline on legacy or partial data.
+    pub fn get_expected_hash(
+        &self,
+        dir_id: i64,
+        rel_path: &str,
+    ) -> anyhow::Result<Option<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT expected_sha256, size FROM file_hashes
+                 WHERE dir_id = ?1 AND rel_path = ?2",
+                params![dir_id, rel_path],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Return the input state a `*Failed` row should be reset to so the
+    /// next run re-attempts the phase that failed. Returns `None` for
+    /// any non-failed state.
+    fn reset_state_for_failed(state: DirectoryState) -> Option<DirectoryState> {
+        match state {
+            DirectoryState::SyncingFailed    => Some(DirectoryState::Detected),
+            DirectoryState::AnalyzeFailed   => Some(DirectoryState::Synced),
+            DirectoryState::RenameFailed    => Some(DirectoryState::Analyzed),
+            DirectoryState::TranscodeFailed => Some(DirectoryState::Renamed),
+            DirectoryState::MoveFailed      => Some(DirectoryState::Renamed),
+            _ => None,
+        }
     }
 
     /// Update the state of a directory.
@@ -198,10 +459,21 @@ impl Database {
         Ok(())
     }
 
-    pub fn set_directory_error(&self, id: i64, message: &str) -> anyhow::Result<()> {
+    /// Mark a directory as failed in the given phase, with a message.
+    ///
+    /// The state argument must be one of the `*Failed` variants (e.g.
+    /// `DirectoryState::MoveFailed`). The pipeline auto-retries failed
+    /// rows on the next sync via `upsert_directory` — see that function
+    /// for the reset mapping.
+    pub fn set_directory_error(
+        &self,
+        id: i64,
+        state: DirectoryState,
+        message: &str,
+    ) -> anyhow::Result<()> {
         self.conn.lock().unwrap().execute(
-            "UPDATE directories SET state = 'failed', error_message = ?1 WHERE id = ?2",
-            params![message, id],
+            "UPDATE directories SET state = ?1, error_message = ?2 WHERE id = ?3",
+            params![state.as_str(), message, id],
         )?;
         Ok(())
     }
@@ -606,9 +878,9 @@ mod tests {
     fn test_set_directory_error() {
         let db = in_memory_db();
         db.upsert_directory("movies", "/srv/data/media/movies/Bad", "/staging/Movies/Bad", "hash000").unwrap();
-        db.set_directory_error(1, "something went wrong").unwrap();
+        db.set_directory_error(1, DirectoryState::MoveFailed, "something went wrong").unwrap();
 
-        let failed = db.get_directories_in_state(DirectoryState::Failed).unwrap();
+        let failed = db.get_directories_in_state(DirectoryState::MoveFailed).unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].error_message, Some("something went wrong".to_string()));
     }
@@ -799,9 +1071,12 @@ mod tests {
     fn test_dedup_failed_state_recovered_by_manifest_change() {
         let db = in_memory_db();
         let id = make_dir(&db, "tvshows", "/srv/data/media/tv/Broken", "hash-X");
-        db.set_directory_error(id, "rsync connection timed out").unwrap();
+        // Mark the row as failed at the sync phase. With the per-phase
+        // failure states, we use SyncingFailed for a directory that
+        // never made it past download.
+        db.set_directory_error(id, DirectoryState::SyncingFailed, "rsync connection timed out").unwrap();
 
-        let failed = db.get_directories_in_state(DirectoryState::Failed).unwrap();
+        let failed = db.get_directories_in_state(DirectoryState::SyncingFailed).unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(
             failed[0].error_message.as_deref(),
@@ -821,6 +1096,178 @@ mod tests {
         let after = db.get_directory_by_id(id).unwrap().unwrap();
         assert_eq!(after.state, DirectoryState::Detected);
         assert!(after.error_message.is_none());
+    }
+
+    /// A row stuck in a `*Failed` state should be reset to the
+    /// phase's input state on the next upsert, *even when the manifest
+    /// hash is unchanged*. This pins the recovery path for transient
+    /// failures whose root cause has been fixed (e.g. CIFS permission
+    /// denial after a uid/gid fix).
+    #[test]
+    fn test_failed_state_resets_without_manifest_change() {
+        let db = in_memory_db();
+        let id = make_dir(&db, "tvshows", "/srv/data/media/tv/Stuck", "hash-A");
+        // Drive the directory all the way to MoveFailed so we can
+        // assert the reset to Renamed (move's input state).
+        db.set_directory_state(id, DirectoryState::Synced).unwrap();
+        db.set_directory_state(id, DirectoryState::Analyzed).unwrap();
+        db.set_directory_state(id, DirectoryState::Renamed).unwrap();
+        db.set_directory_error(id, DirectoryState::MoveFailed, "cifs write denied").unwrap();
+
+        let after = db.get_directory_by_id(id).unwrap().unwrap();
+        assert_eq!(after.state, DirectoryState::MoveFailed);
+        assert_eq!(after.error_message.as_deref(), Some("cifs write denied"));
+
+        // Same manifest hash — the only trigger for a reset is the
+        // *Failed state itself.
+        db.upsert_directory(
+            "tvshows",
+            "/srv/data/media/tv/Stuck",
+            "/staging/Stuck",
+            "hash-A",
+        )
+        .unwrap();
+
+        let after = db.get_directory_by_id(id).unwrap().unwrap();
+        assert_eq!(
+            after.state,
+            DirectoryState::Renamed,
+            "MoveFailed should reset to Renamed so the move phase retries"
+        );
+        assert!(
+            after.error_message.is_none(),
+            "error_message must be cleared on retry"
+        );
+    }
+
+    /// Each `*Failed` variant maps to its own input state. Cover all
+    /// five mappings in a single table-driven test.
+    #[test]
+    fn test_each_failed_variant_resets_to_correct_input_state() {
+        let cases: &[(DirectoryState, DirectoryState, &str)] = &[
+            (DirectoryState::SyncingFailed,    DirectoryState::Detected, "hash-sync"),
+            (DirectoryState::AnalyzeFailed,   DirectoryState::Synced,   "hash-ana"),
+            (DirectoryState::RenameFailed,    DirectoryState::Analyzed, "hash-ren"),
+            (DirectoryState::TranscodeFailed, DirectoryState::Renamed,  "hash-tra"),
+            (DirectoryState::MoveFailed,      DirectoryState::Renamed,  "hash-mov"),
+        ];
+        for (i, (failed, expected, hash)) in cases.iter().enumerate() {
+            let db = in_memory_db();
+            let id = make_dir(
+                &db,
+                "tvshows",
+                &format!("/srv/data/media/tv/Case{}", i),
+                hash,
+            );
+            db.set_directory_error(id, *failed, "transient error").unwrap();
+
+            // Sanity: the failed state is set.
+            let before = db.get_directory_by_id(id).unwrap().unwrap();
+            assert_eq!(before.state, *failed);
+
+            // Re-upsert with the same hash — the row should reset to the
+            // phase's input state with error_message cleared.
+            db.upsert_directory(
+                "tvshows",
+                &format!("/srv/data/media/tv/Case{}", i),
+                &format!("/staging/Case{}", i),
+                hash,
+            )
+            .unwrap();
+
+            let after = db.get_directory_by_id(id).unwrap().unwrap();
+            assert_eq!(
+                after.state, *expected,
+                "{:?} should reset to {:?}, got {:?}",
+                failed, expected, after.state
+            );
+            assert!(
+                after.error_message.is_none(),
+                "error_message must be cleared for {:?}",
+                failed
+            );
+        }
+    }
+
+    /// Simulate an existing DB at the pre-refactor schema (single
+    /// `failed` state, no per-phase variants), then re-open it. The
+    /// migration in `init_schema` should rebuild the table with the
+    /// new CHECK constraint, preserve all rows, and reset the old
+    /// `failed` rows to `detected` so the next sync can pick them up.
+    #[test]
+    fn test_schema_migration_from_old_failed_state() {
+        use rusqlite::Connection;
+
+        // Build a fresh on-disk DB at the old schema.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE directories (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category        TEXT NOT NULL,
+                    remote_path     TEXT NOT NULL,
+                    staging_path    TEXT NOT NULL,
+                    library_path    TEXT,
+                    state           TEXT NOT NULL CHECK(state IN (
+                        'detected','syncing','synced',
+                        'analyzing','analyzed',
+                        'renaming','renamed',
+                        'transcoding','transcoded',
+                        'moving','in_library','failed')),
+                    manifest_hash   TEXT,
+                    detected_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    synced_at       DATETIME,
+                    analyzed_at     DATETIME,
+                    renamed_at      DATETIME,
+                    transcoded_at   DATETIME,
+                    moved_at        DATETIME,
+                    detected_policy TEXT,
+                    plex_scan_at    DATETIME,
+                    error_message   TEXT,
+                    UNIQUE(category, remote_path)
+                );
+                INSERT INTO directories
+                    (category, remote_path, staging_path, state,
+                     manifest_hash, error_message)
+                VALUES
+                    ('tvshows', '/srv/data/media/tv/Stuck1', '/staging/Stuck1', 'failed', 'h1', 'cifs denied'),
+                    ('movies',  '/srv/data/media/movies/Stuck2', '/staging/Stuck2', 'failed', 'h2', 'rsync timeout'),
+                    ('tvshows', '/srv/data/media/tv/Good', '/staging/Good', 'in_library', 'h3', NULL);
+                "#,
+            ).unwrap();
+        }
+
+        // Reopen via Database::open — should trigger the migration.
+        let db = Database::open(&db_path).unwrap();
+
+        // The two old-failed rows should now be in `detected` (the
+        // migration's CASE clause resets them).
+        let detected = db.get_directories_in_state(DirectoryState::Detected).unwrap();
+        assert_eq!(
+            detected.len(), 2,
+            "old `failed` rows should be reset to detected by the migration"
+        );
+        for d in &detected {
+            assert!(
+                d.error_message.is_none(),
+                "error_message should be cleared after migration, got {:?}",
+                d.error_message
+            );
+        }
+
+        // The healthy in_library row should still be in_library.
+        let in_lib = db.get_directories_in_state(DirectoryState::InLibrary).unwrap();
+        assert_eq!(in_lib.len(), 1);
+        assert_eq!(in_lib[0].manifest_hash.as_deref(), Some("h3"));
+
+        // And the new schema accepts per-phase failed states.
+        let id = detected[0].id;
+        db.set_directory_error(id, DirectoryState::MoveFailed, "perm denied").unwrap();
+        let stuck = db.get_directories_in_state(DirectoryState::MoveFailed).unwrap();
+        assert_eq!(stuck.len(), 1);
     }
 
     #[test]
@@ -980,5 +1427,108 @@ mod tests {
         let cached = db.get_cached_metadata("hash-y").unwrap().unwrap();
         assert_eq!(cached.title, "Yearless");
         assert_eq!(cached.year, None);
+    }
+
+    // ----------------------------------------------------------------------
+    // file_hashes tests
+    //
+    // The per-file SHA-256 fingerprint table is the cache that lets
+    // `download_file` verify a downloaded file against the bytes the
+    // remote had at manifest-collection time. These tests pin the
+    // SQL contract: upsert replaces the full set per directory,
+    // get-by-key returns the right tuple, and the FK cascade drops
+    // the rows when the parent directory row is deleted.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_upsert_file_hashes_round_trip() {
+        let db = in_memory_db();
+        let dir_id = make_dir(&db, "movies", "/srv/data/media/movies/Foo", "h1");
+
+        // Use realistic 64-char hex hashes (sha256sum format). The DB
+        // doesn't validate the format, but a real-shape string keeps
+        // the test honest.
+        let hashes: Vec<(String, String, i64, i64)> = vec![
+            ("movie.mkv".to_string(),
+             "a".repeat(64),
+             60_000_000_000_i64,
+             1_700_000_000),
+            ("subs/en.srt".to_string(),
+             "b".repeat(64),
+             50_000_i64,
+             1_700_000_001),
+        ];
+        db.upsert_file_hashes(dir_id, &hashes).unwrap();
+
+        let got = db.get_expected_hash(dir_id, "movie.mkv").unwrap()
+            .expect("movie.mkv should be present");
+        assert_eq!(got.0, "a".repeat(64));
+        assert_eq!(got.1, 60_000_000_000);
+
+        let got2 = db.get_expected_hash(dir_id, "subs/en.srt").unwrap()
+            .expect("subs/en.srt should be present");
+        assert_eq!(got2.0, "b".repeat(64));
+        assert_eq!(got2.1, 50_000);
+
+        // Missing keys are a miss, not an error.
+        assert!(db.get_expected_hash(dir_id, "nope.mkv").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_upsert_file_hashes_replaces_previous() {
+        // The contract: a second upsert for the same dir_id fully
+        // replaces the prior set. This is the mechanism that keeps
+        // `file_hashes` in lock-step with the SFTP walk when files
+        // appear or disappear on the remote.
+        let db = in_memory_db();
+        let dir_id = make_dir(&db, "tvshows", "/srv/data/media/tv/Show", "h");
+
+        let first: Vec<(String, String, i64, i64)> = vec![
+            ("ep1.mkv".to_string(), "1".repeat(64), 1_000, 1),
+            ("ep2.mkv".to_string(), "2".repeat(64), 1_000, 1),
+        ];
+        db.upsert_file_hashes(dir_id, &first).unwrap();
+        assert!(db.get_expected_hash(dir_id, "ep1.mkv").unwrap().is_some());
+        assert!(db.get_expected_hash(dir_id, "ep2.mkv").unwrap().is_some());
+
+        // ep2 was deleted on the remote; ep3 was added.
+        let second: Vec<(String, String, i64, i64)> = vec![
+            ("ep1.mkv".to_string(), "1".repeat(64), 1_000, 1),
+            ("ep3.mkv".to_string(), "3".repeat(64), 1_000, 1),
+        ];
+        db.upsert_file_hashes(dir_id, &second).unwrap();
+
+        assert!(db.get_expected_hash(dir_id, "ep1.mkv").unwrap().is_some());
+        assert!(
+            db.get_expected_hash(dir_id, "ep2.mkv").unwrap().is_none(),
+            "ep2 should be gone after the second upsert"
+        );
+        assert!(db.get_expected_hash(dir_id, "ep3.mkv").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_upsert_file_hashes_cascade_on_directory_delete() {
+        // FK cascade: deleting the parent directory row must drop
+        // its file_hashes rows. If the cascade were missing, the
+        // `file_hashes` table would accumulate stale rows for
+        // directories the pipeline forgot about, slowly bloating the
+        // DB.
+        let db = in_memory_db();
+        let dir_id = make_dir(&db, "movies", "/srv/data/media/movies/WillDie", "h");
+        let hashes: Vec<(String, String, i64, i64)> = vec![
+            ("a.mkv".to_string(), "a".repeat(64), 1, 1),
+        ];
+        db.upsert_file_hashes(dir_id, &hashes).unwrap();
+        assert!(db.get_expected_hash(dir_id, "a.mkv").unwrap().is_some());
+
+        // Direct DELETE on the parent row (the pipeline never
+        // deletes directories in practice, but the schema must
+        // enforce this in case a future feature does).
+        db.conn.lock().unwrap()
+            .execute("DELETE FROM directories WHERE id = ?1", params![dir_id])
+            .unwrap();
+
+        // The cascade should have taken the hash row with it.
+        assert!(db.get_expected_hash(dir_id, "a.mkv").unwrap().is_none());
     }
 }
