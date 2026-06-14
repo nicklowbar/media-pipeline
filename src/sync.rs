@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context};
 use russh::{client, keys::key::PublicKey, ChannelId, Disconnect};
@@ -456,11 +457,14 @@ impl SyncEngine {
             let remote_dir_str = remote_dir.to_string_lossy().to_string();
             let staging_dir_str = staging_dir.to_string_lossy().to_string();
 
+            info!(dir = %dir_name, "sync: directory walk starting");
+
             // Walk the remote tree once. The collected manifest is the
             // input to both the manifest hash (for change detection)
             // and the per-file sha256 collection (for download-time
             // integrity verification). Walking twice would double the
             // per-dir cost for no benefit.
+            let walk_started = Instant::now();
             let manifest = match self.collect_manifest(&raw, &remote_dir).await {
                 Ok(m) => m,
                 Err(e) => {
@@ -468,6 +472,12 @@ impl SyncEngine {
                     continue;
                 }
             };
+            info!(
+                dir = %dir_name,
+                file_count = manifest.len(),
+                duration_secs = format!("{:.2}", walk_started.elapsed().as_secs_f64()),
+                "sync: directory walk complete"
+            );
 
             // Per-file hashes from the remote. Best-effort: a
             // transport error here logs a WARN and proceeds with an
@@ -475,11 +485,18 @@ impl SyncEngine {
             // block the rest of the sync. The download path treats a
             // missing hash as "skip verification", not as a hard
             // error.
+            let hash_started = Instant::now();
             let file_hashes = self.collect_remote_hashes(&remote_dir, &manifest).await
                 .unwrap_or_else(|e| {
                     warn!(dir = %dir_name, error = %e, "failed to collect remote hashes; verification will be skipped for this dir");
                     Vec::new()
                 });
+            info!(
+                dir = %dir_name,
+                hash_count = file_hashes.len(),
+                duration_secs = format!("{:.2}", hash_started.elapsed().as_secs_f64()),
+                "sync: remote hashes collected"
+            );
 
             // Compute the manifest hash from the size+mtime tuples
             // (the remote hash is not part of the manifest — that
@@ -487,9 +504,16 @@ impl SyncEngine {
             // a file on the remote, which is meaningless).
             let manifest_hash = manifest_hash_from_files(&manifest);
 
+            let upsert_started = Instant::now();
             let dir_id = db.upsert_directory(category, &remote_dir_str, &staging_dir_str, &manifest_hash)?;
             db.upsert_file_hashes(dir_id, &file_hashes)?;
-            trace!(dir = %dir_name, hash = %manifest_hash, dir_id, hash_count = file_hashes.len(), "upserted directory");
+            info!(
+                dir = %dir_name,
+                dir_id,
+                manifest_hash = %manifest_hash,
+                duration_secs = format!("{:.2}", upsert_started.elapsed().as_secs_f64()),
+                "sync: directory upserted"
+            );
         }
 
         // Download directories that are in 'detected' state
@@ -587,7 +611,16 @@ impl SyncEngine {
         // prefix, name)` pushed on the stack.
         let mut stack: Vec<(PathBuf, String)> = vec![(dir.to_path_buf(), String::new())];
 
+        let walk_started = Instant::now();
+
         while let Some((cur_dir, prefix)) = stack.pop() {
+            let rel_display = if prefix.is_empty() {
+                "<root>".to_string()
+            } else {
+                prefix.clone()
+            };
+            debug!(subdir = %rel_display, "manifest: walking subdir");
+
             let dir_handle = raw.opendir(cur_dir.to_string_lossy().into_owned()).await
                 .with_context(|| format!("failed to opendir {}", cur_dir.display()))?;
             let dir_handle_str = dir_handle.handle;
@@ -627,6 +660,12 @@ impl SyncEngine {
 
             let _ = raw.close(&dir_handle_str).await;
         }
+
+        debug!(
+            file_count = files.len(),
+            duration_secs = format!("{:.2}", walk_started.elapsed().as_secs_f64()),
+            "manifest: walk finished"
+        );
 
         Ok(files)
     }
@@ -672,6 +711,8 @@ impl SyncEngine {
         remote_dir: &Path,
         manifest: &BTreeMap<String, (u64, u64)>,
     ) -> anyhow::Result<Vec<(String, String, i64, i64)>> {
+        let hash_started = Instant::now();
+
         if manifest.is_empty() {
             return Ok(Vec::new());
         }
@@ -701,6 +742,11 @@ impl SyncEngine {
         if skipped_newline > 0 {
             info!(skipped = skipped_newline, "skipped paths with embedded newlines during hash collection");
         }
+
+        info!(
+            file_count = paths.len(),
+            "sync: remote hashing starting"
+        );
 
         // Open a new session channel. This is independent of the
         // SFTP subsystem channel used for downloads — `exec` runs
@@ -757,7 +803,16 @@ impl SyncEngine {
 
         let text = String::from_utf8(output)
             .context("sha256sum output is not valid UTF-8")?;
-        parse_sha256sum_output(&text, remote_dir, manifest)
+        let parsed = parse_sha256sum_output(&text, remote_dir, manifest)?;
+
+        info!(
+            file_count = paths.len(),
+            bytes_read = text.len(),
+            duration_secs = format!("{:.2}", hash_started.elapsed().as_secs_f64()),
+            "sync: remote hashing complete"
+        );
+
+        Ok(parsed)
     }
 
     async fn download_directory(
