@@ -23,13 +23,16 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 /// enough cadence to spot a stuck transfer without flooding the log.
 const THROUGHPUT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Maximum total time a single file transfer is allowed to take. If
-/// exceeded, the transfer is aborted with a warning and the directory
-/// is marked `sync_failed`; the auto-retry mechanism picks it up on
-/// the next run. Set generously enough to cover legitimate slow
-/// transfers (e.g. a 60GB 4K REMUX on a constrained link) but tight
-/// enough that a hung SFTP session doesn't tie up the pipeline.
-const TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// No per-file total timeout. The stall timeout (below) catches the
+/// "no bytes at all" case within a minute; for the "bytes are
+/// trickling but pathologically slow" case, the deploy-side pipeline
+/// watchdog (cron + container restart) is the safety net. A fixed
+/// total budget would have to be sized for the slowest legitimate
+/// transfer we expect — a 200 GB file at 50 Mbps is ~9 hours, and a
+/// 60 GB REMUX at 25 Mbps is ~5 hours. Picking any number risks
+/// killing a transfer that was making real, if slow, progress. The
+/// previous 30-minute value killed healthy 60 GB files at 50 Mbps
+/// (which legitimately take ~3h), so we removed the check entirely.
 
 /// Maximum time a single SFTP read is allowed to take without
 /// producing any bytes. A healthy SFTP read on even a slow link
@@ -1047,7 +1050,6 @@ impl SyncEngine {
                 chunk_size: SFTP_READ_CHUNK,
                 max_inflight: SFTP_INFLIGHT_REQUESTS,
                 stall_timeout: STALL_TIMEOUT,
-                total_timeout: TRANSFER_TIMEOUT,
             },
             ProgressReporter {
                 file_label: &remote_str,
@@ -1174,10 +1176,6 @@ pub(crate) struct PipelinedReadConfig {
     /// this duration is treated as a stuck SFTP layer and aborts the
     /// file.
     pub stall_timeout: std::time::Duration,
-    /// Total wall-clock budget for the whole transfer. Checked on
-    /// each completed read, so a transfer that hangs at EOF still
-    /// gets a chance to finish.
-    pub total_timeout: std::time::Duration,
 }
 
 /// Live progress state for the throughput logger. Held by the
@@ -1264,9 +1262,10 @@ impl SftpChunkReader for RawSessionReader {
 /// caller is responsible for ensuring the file exists and is
 /// pre-extended to `total` bytes.
 ///
-/// Stall and total timeouts are enforced as in the single-request
-/// loop. The function returns the total bytes written to disk (==
-/// highest offset reached on success).
+/// The per-read stall timeout is enforced; there is no total-time
+/// budget (see the comment on the removed `TRANSFER_TIMEOUT` const
+/// above for the rationale). The function returns the total bytes
+/// written to disk (== highest offset reached on success).
 pub(crate) async fn pipelined_read_to_file(
     reader: Arc<dyn SftpChunkReader>,
     handle: String,
@@ -1404,33 +1403,7 @@ pub(crate) async fn pipelined_read_to_file(
             *progress.next_offset_to_write = end;
         }
 
-        // 5. Per-file total-time budget. Checked on each completion,
-        //    not each read, so a transfer that hangs at EOF (right
-        //    before the last read returns) still gets a chance to
-        //    complete. The per-read stall timeout catches the "no
-        //    bytes for 60s" case fast.
-        if progress.start.elapsed() > config.total_timeout {
-            let elapsed = progress.start.elapsed().as_secs();
-            let bytes_this_run = *progress.next_offset_to_write - *progress.start_offset;
-            warn!(
-                file = %progress.file_label,
-                bytes = *progress.next_offset_to_write,
-                total = progress.total,
-                bytes_this_run,
-                elapsed_secs = elapsed,
-                timeout_secs = config.total_timeout.as_secs(),
-                "transfer exceeded per-file timeout, aborting"
-            );
-            anyhow::bail!(
-                "transfer timeout for file {}: {}s elapsed, {} of {} bytes",
-                progress.file_label,
-                elapsed,
-                *progress.next_offset_to_write,
-                progress.total
-            );
-        }
-
-        // 6. Periodic throughput log. The rate is computed against
+        // 5. Periodic throughput log. The rate is computed against
         //    the interval between emissions, not the lifetime
         //    average, so stalls and bursts show up clearly.
         let now = tokio::time::Instant::now();
@@ -1601,7 +1574,6 @@ mod tests {
                 chunk_size,
                 max_inflight,
                 stall_timeout: Duration::from_secs(5),
-                total_timeout: Duration::from_secs(30),
             },
             ProgressReporter {
                 file_label: "test",
@@ -1703,7 +1675,6 @@ mod tests {
                 chunk_size: 256,
                 max_inflight: 4,
                 stall_timeout: Duration::from_secs(5),
-                total_timeout: Duration::from_secs(30),
             },
             ProgressReporter {
                 file_label: "test",
