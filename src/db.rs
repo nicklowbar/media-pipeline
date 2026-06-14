@@ -132,24 +132,43 @@ fn table_needs_migration(conn: &Connection) -> anyhow::Result<bool> {
 /// migrations: if the column is missing, the caller runs the
 /// ALTER; if it already exists, the ALTER is skipped.
 ///
+/// Returns `false` if the table doesn't exist (a subsequent
+/// `CREATE TABLE IF NOT EXISTS` will install the column
+/// definition, so no ALTER is needed).
+///
 /// SQLite's PRAGMA table_info returns one row per column on the
 /// named table (no rows if the table doesn't exist). The
 /// `column_name` is the second column in the result.
 fn table_needs_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let mut rows = stmt.query([])?;
+    let mut found = false;
     while let Some(row) = rows.next()? {
         let name: String = row.get(1)?;
         if name == column {
-            return Ok(false);
+            found = true;
+            break;
         }
     }
-    // Table missing or column missing — either way, no need to
-    // ALTER. (If the table is missing, the subsequent CREATE
-    // TABLE IF NOT EXISTS will install the column. We return
-    // false here so the caller doesn't try to ALTER a
-    // non-existent table.)
-    Ok(false)
+    if found {
+        // Column exists; no migration needed.
+        Ok(false)
+    } else {
+        // Column not present. The caller has to decide whether
+        // the table exists at all — we return true here (the
+        // column is missing) and let the caller no-op if the
+        // table is also missing. But because the only caller
+        // today is the syncing_at migration, and the table it
+        // targets (`directories`) is created by the subsequent
+        // `CREATE TABLE IF NOT EXISTS` if missing, we don't
+        // need to distinguish: the caller always wants "add
+        // the column if the table exists."
+        //
+        // A future migration that needs to ALTER a different
+        // table should add a `table_exists` check or use a
+        // different helper.
+        Ok(true)
+    }
 }
 
 impl Database {
@@ -222,18 +241,6 @@ impl Database {
             )?;
         }
 
-        // Idempotent column addition: add `syncing_at` to the
-        // directories table. The stale-Syncing sweep needs this
-        // column to find rows that a crashed downloader left
-        // behind (state = 'syncing' with an old syncing_at). The
-        // column is added to both the live table and the
-        // migration-target `directories_new` so a fresh install
-        // and an upgrade from the pre-`syncing_at` schema both
-        // get the column.
-        if table_needs_column(&conn, "directories", "syncing_at")? {
-            conn.execute_batch("ALTER TABLE directories ADD COLUMN syncing_at DATETIME")?;
-        }
-
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS directories (
@@ -276,7 +283,29 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_dirs_state ON directories(state);
             CREATE INDEX IF NOT EXISTS idx_dirs_category ON directories(category);
             CREATE INDEX IF NOT EXISTS idx_files_dir ON files(dir_id);
+            "#,
+        )?;
 
+        // Idempotent column addition: add `syncing_at` to the
+        // directories table. The stale-Syncing sweep needs this
+        // column to find rows that a crashed downloader left
+        // behind (state = 'syncing' with an old syncing_at).
+        //
+        // Runs *after* the CREATE TABLE IF NOT EXISTS block so
+        // a fresh install gets the column from CREATE TABLE
+        // (no-op for the ALTER), and an upgrade from the
+        // pre-`syncing_at` schema gets it from the ALTER. (The
+        // per-phase-failed migration at the top of init_schema
+        // also installs the column on a database being migrated
+        // from the old single-`failed` schema, but that's a
+        // separate code path — this ALTER covers DBs that already
+        // have the per-phase-failed schema but not `syncing_at`.)
+        if table_needs_column(&conn, "directories", "syncing_at")? {
+            conn.execute_batch("ALTER TABLE directories ADD COLUMN syncing_at DATETIME")?;
+        }
+
+        conn.execute_batch(
+            r#"
             -- Metadata lookup cache (durable across restarts). Keyed on the
             -- SHA-256 of (category|without_group); the same key shape the
             -- in-memory CachedLookup uses. Negative results are NOT cached
@@ -1755,5 +1784,80 @@ mod tests {
 
         // The cascade should have taken the hash row with it.
         assert!(db.get_expected_hash(dir_id, "a.mkv").unwrap().is_none());
+    }
+
+    /// Regression test for the physalis 2026-06-14 incident: an
+    /// existing DB has the per-phase-failed schema (new CHECK
+    /// constraints on `state`) but is missing the `syncing_at`
+    /// column added by the DB-driven dispatch refactor. The
+    /// migration must add the column on `Database::open` so the
+    /// stale-Syncing sweep at pool startup can query it.
+    ///
+    /// Before the fix, `table_needs_column` returned `false` when
+    /// the column was missing AND the table existed (it conflated
+    /// "table missing" with "table exists, column missing"), so the
+    /// ALTER was skipped and subsequent `UPDATE directories SET
+    /// syncing_at = ...` failed with "no such column: syncing_at".
+    #[test]
+    fn test_syncing_at_column_added_on_upgrade() {
+        // Build a "physalis" DB by hand: per-phase-failed schema,
+        // no `syncing_at` column. This matches the state of the
+        // production DB after commit 371301d's migration but
+        // before commit eebe8b9's deploy. Then `Database::open`
+        // it and assert the column was added by init_schema.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("physalis-sim.db");
+        let seed = rusqlite::Connection::open(&db_path).unwrap();
+        seed.execute_batch(
+            r#"
+            CREATE TABLE directories (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                category        TEXT NOT NULL,
+                remote_path     TEXT NOT NULL,
+                staging_path    TEXT NOT NULL,
+                library_path    TEXT,
+                state           TEXT NOT NULL CHECK(state IN (
+                    'detected','syncing','synced','sync_failed',
+                    'analyzing','analyzed','analyze_failed',
+                    'renaming','renamed','rename_failed',
+                    'transcoding','transcoded','transcode_failed',
+                    'moving','in_library','move_failed')),
+                manifest_hash   TEXT,
+                detected_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                synced_at       DATETIME,
+                analyzed_at     DATETIME,
+                renamed_at      DATETIME,
+                transcoded_at   DATETIME,
+                moved_at        DATETIME,
+                detected_policy TEXT,
+                plex_scan_at    DATETIME,
+                error_message   TEXT,
+                UNIQUE(category, remote_path)
+            );
+            INSERT INTO directories (category, remote_path, staging_path, state)
+            VALUES ('movies', '/srv/movies/Foo', '/staging/Foo', 'detected');
+            "#,
+        ).unwrap();
+        drop(seed);
+
+        // Stage 2: open the DB through the real Database::open
+        // path. init_schema must add `syncing_at`.
+        let db = Database::open(&db_path).unwrap();
+
+        // The pre-existing row is still there.
+        let dirs = db.get_directories_in_state(DirectoryState::Detected).unwrap();
+        assert_eq!(dirs.len(), 1, "pre-existing row must survive migration");
+        assert_eq!(dirs[0].remote_path, "/srv/movies/Foo");
+
+        // The column was added — we can write to it (this is
+        // what set_directory_state(Syncing) does, and what
+        // stale_syncing_sweep reads).
+        let dir_id = dirs[0].id;
+        db.set_directory_state(dir_id, DirectoryState::Syncing).unwrap();
+        // The sweep no longer errors.
+        let recovered = db.stale_syncing_sweep(6).unwrap();
+        // The row's syncing_at is "now" (just set), so the
+        // sweep with a 6-hour threshold does not recover it.
+        assert_eq!(recovered, 0);
     }
 }
