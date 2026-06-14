@@ -51,11 +51,24 @@ pub fn build_metadata_lookup(config: &Config, db: &Database) -> Arc<dyn Metadata
 pub async fn run_sync(config: &Config, db: &Database) -> anyhow::Result<()> {
     info!("starting sync phase");
 
-    let mut sync_engine = sync::SyncEngine::new(config).await
-        .context("failed to initialize sync engine")?;
-
     for (category_name, _) in &config.categories {
         info!(category = %category_name, "syncing category");
+        // Fresh SyncEngine per category: the walker takes
+        // the session Handle when it spawns and disconnects
+        // when it finishes, so the next category needs its
+        // own SSH connection. ~200ms handshake per category
+        // is fine — the actual sync work is hours for a
+        // full library, and the bookkeeping keeps each
+        // category's walker + downloader pool fully
+        // isolated.
+        let mut sync_engine = match sync::SyncEngine::new(config).await {
+            Ok(engine) => engine,
+            Err(e) => {
+                error!(category = %category_name, error = %e,
+                    "failed to initialize sync engine; skipping category");
+                continue;
+            }
+        };
         if let Err(e) = sync_engine.sync_category(category_name, db).await {
             error!(category = %category_name, error = %e, "category sync failed");
             // Continue with other categories rather than failing the whole pipeline
