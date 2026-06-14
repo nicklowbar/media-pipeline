@@ -179,6 +179,7 @@ mod tests {
                 m
             },
             metadata: crate::config::MetadataConfig::default(),
+            sync: crate::config::SyncConfig::default(),
         }
     }
 

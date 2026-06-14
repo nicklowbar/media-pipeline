@@ -19,6 +19,9 @@
 #                                    binary; no matching TOML field)
 #   MEDIA_PIPELINE_TMDB_API_KEY     overrides [metadata].tmdb_api_key
 #   MEDIA_PIPELINE_LOG_LEVEL        overrides [logging].level
+#   MEDIA_PIPELINE_SYNC_MAX_DOWNLOAD_RETRIES
+#                                 overrides [sync].max_download_retries
+#                                 (defaults to 2)
 #
 # This file is shipped inside the container at /etc/media-pipeline/config.toml
 # and is the source of truth for the pipeline's *structure* (categories,
@@ -79,6 +82,19 @@ games = 7
 # enabled_categories = ["movies", "tvshows"]
 # request_timeout_secs = 5
 # cache_ttl_days = 30
+
+# Sync-phase tunables. The walker and downloader pool run
+# concurrently; the per-file retry budget here is a separate
+# question. A single file that exhausts the budget halts the
+# whole pipeline (`bail!`), which makes the cron exit non-zero
+# and pages the operator. The rationale: 3 consecutive failures
+# on the same file with the same code path is a strong signal
+# of a software fault in the parallel downloader, not a
+# transient network blip. Retry delays are 2^attempt seconds
+# (2s, 4s, 8s, …) capped at 30s; a budget of 0 disables
+# retries entirely.
+[sync]
+# max_download_retries = 2
 
 # Categories define where content comes from and where it goes.
 # Per-title ffprobe analysis still runs (records codec/resolution

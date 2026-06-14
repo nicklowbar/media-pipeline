@@ -338,7 +338,7 @@ pub fn print_status(db: &Database) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CategoryConfig, Config, DatabaseConfig, MetadataConfig, PathsConfig, PlexConfig, SshConfig};
+    use crate::config::{CategoryConfig, Config, DatabaseConfig, MetadataConfig, PathsConfig, PlexConfig, SshConfig, SyncConfig};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -380,6 +380,7 @@ mod tests {
             group_name: Some("REPACK".to_string()),
             categories,
             metadata: MetadataConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 

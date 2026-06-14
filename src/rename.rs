@@ -1266,6 +1266,7 @@ mod tests {
             group_name: Some("REPACK".to_string()),
             categories: std::collections::HashMap::new(),
             metadata: crate::config::MetadataConfig::default(),
+            sync: crate::config::SyncConfig::default(),
         }
     }
 

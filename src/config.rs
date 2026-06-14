@@ -31,6 +31,10 @@ pub mod env {
     /// chatty out of the box — `tracing-subscriber`'s default is
     /// `error` only, which produces empty logs.
     pub const LOG_LEVEL: &str = "MEDIA_PIPELINE_LOG_LEVEL";
+    /// Override for `[sync].max_download_retries`. Set to a non-
+    /// negative integer; values that don't parse as `u32` are
+    /// ignored. Default is 2 in-code (= 3 total attempts).
+    pub const SYNC_MAX_DOWNLOAD_RETRIES: &str = "MEDIA_PIPELINE_SYNC_MAX_DOWNLOAD_RETRIES";
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +52,11 @@ pub struct Config {
     /// pipeline uses `NoopLookup` (no API calls).
     #[serde(default)]
     pub metadata: MetadataConfig,
+    /// Sync-phase tunables: retry budgets, concurrency, etc.
+    /// Optional — every field has an in-code default so an
+    /// omitted `[sync]` block is a no-op.
+    #[serde(default)]
+    pub sync: SyncConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,6 +164,37 @@ impl MetadataConfig {
     }
 }
 
+/// Sync-phase tunables. The fields are optional because the
+/// in-code defaults (computed via the `max_download_retries()`
+/// accessor) are the right answer for most deployments. The
+/// `[sync]` TOML block is omitted in the default config and
+/// surfaces only when an operator needs to override.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SyncConfig {
+    /// Max retry attempts for a single file's download before
+    /// the whole pipeline halts. The default is 2 (= 3 total
+    /// attempts). Set to 0 to disable retries entirely. The
+    /// halt behavior is `bail!` from `sync_category` so the
+    /// cron's exit code is non-zero and the operator gets
+    /// paged — the rationale is that a single file that
+    /// consistently fails 3 attempts is a strong signal of a
+    /// software fault in the downloader, not a transient
+    /// network blip. The user explicitly asked for this
+    /// halt-on-exhaustion policy.
+    #[serde(default)]
+    pub max_download_retries: Option<u32>,
+}
+
+impl Config {
+    /// Resolved max-retry budget. The TOML value (when set)
+    /// wins, else the in-code default of 2. The env-var
+    /// override is applied earlier in `apply_env_overrides`
+    /// and lands here as a direct field value.
+    pub fn max_download_retries(&self) -> u32 {
+        self.sync.max_download_retries.unwrap_or(2)
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)
@@ -196,6 +236,8 @@ impl Config {
                 });
             }
         }
+        // Sync-phase tunables. Apply after TOML parse so env wins.
+        apply_env_u32(&mut self.sync.max_download_retries, env::SYNC_MAX_DOWNLOAD_RETRIES);
     }
 
     /// Convenience: load the config file and apply env-var overrides
@@ -263,6 +305,21 @@ fn apply_env_u16(target: &mut Option<u16>, var: &str) {
     if let Ok(value) = std::env::var(var) {
         if !value.is_empty() {
             if let Ok(parsed) = value.parse::<u16>() {
+                *target = Some(parsed);
+            }
+        }
+    }
+}
+
+/// u32-flavored version of `apply_env_u16`. Used for the
+/// `[sync].max_download_retries` knob, where a `u16`'s 65 535
+/// ceiling would be absurd but is technically sufficient — we
+/// use `u32` for future-proofing and to match the field type
+/// on `SyncConfig`. Same empty-string + parse-failure guards.
+fn apply_env_u32(target: &mut Option<u32>, var: &str) {
+    if let Ok(value) = std::env::var(var) {
+        if !value.is_empty() {
+            if let Ok(parsed) = value.parse::<u32>() {
                 *target = Some(parsed);
             }
         }

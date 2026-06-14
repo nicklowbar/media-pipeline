@@ -297,8 +297,22 @@ impl Database {
         remote_path: &str,
         staging_path: &str,
         manifest_hash: &str,
-    ) -> anyhow::Result<i64> {
+    ) -> anyhow::Result<(i64, Option<String>)> {
         let conn = self.conn.lock().unwrap();
+        // Look up the previous state *before* the upsert so the
+        // caller can detect a `*Failed → detected` transition. The
+        // walker uses that signal to force a full re-hash of the
+        // remote (see the stale-hash discussion in the plan). On
+        // a brand-new row there's no prior state, so we return
+        // `None` to make the caller's "force re-hash?" decision
+        // explicit (and to make the test assertable).
+        let prev_state: Option<String> = conn
+            .query_row(
+                "SELECT state FROM directories WHERE category = ?1 AND remote_path = ?2",
+                params![category, remote_path],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
         conn.execute(
             r#"
             INSERT INTO directories (category, remote_path, staging_path, state, manifest_hash)
@@ -344,7 +358,7 @@ impl Database {
             params![category, remote_path],
             |row| row.get(0),
         )?;
-        Ok(id)
+        Ok((id, prev_state))
     }
 
     // ----------------------------------------------------------------------
@@ -392,6 +406,63 @@ impl Database {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO file_hashes (dir_id, rel_path, expected_sha256, size, mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for (rel_path, sha256, size, mtime) in hashes {
+                stmt.execute(params![dir_id, rel_path, sha256, size, mtime])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Return the set of `rel_path`s for which we already have a
+    /// recorded SHA-256 for this directory. The walker uses this to
+    /// skip the remote `xargs sha256sum` exec for files we already
+    /// know the hash of — the only way to avoid re-hashing the
+    /// entire tree on every cron tick.
+    ///
+    /// The set is keyed only on `rel_path`; the hash bytes are not
+    /// returned because the walker doesn't need them — it just
+    /// wants to know "is this file already in the DB?" to decide
+    /// whether to add it to the `xargs` stdin list.
+    pub fn get_existing_hashes_for_dir(
+        &self,
+        dir_id: i64,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        use std::collections::HashSet;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT rel_path FROM file_hashes WHERE dir_id = ?1")?;
+        let rows = stmt.query_map(params![dir_id], |row| row.get::<_, String>(0))?;
+        let mut set = HashSet::new();
+        for r in rows {
+            set.insert(r?);
+        }
+        Ok(set)
+    }
+
+    /// Append (rel_path, sha256, size, mtime) tuples to the
+    /// directory's hash set without disturbing existing rows.
+    /// Uses `INSERT OR IGNORE` so re-walking a directory that
+    /// already has a full hash set is a no-op for the unchanged
+    /// files and only writes the new ones.
+    ///
+    /// This is the "re-walk" path complement to
+    /// `upsert_file_hashes` (which is DELETE+INSERT and is used
+    /// only for the first-time walk of a brand-new directory).
+    /// Splitting the two keeps the first-time semantics clean
+    /// (no stale rows from a half-written prior run) while
+    /// making the re-walk cheap.
+    pub fn append_file_hashes(
+        &self,
+        dir_id: i64,
+        hashes: &[(String, String, i64, i64)],
+    ) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO file_hashes (dir_id, rel_path, expected_sha256, size, mtime)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for (rel_path, sha256, size, mtime) in hashes {

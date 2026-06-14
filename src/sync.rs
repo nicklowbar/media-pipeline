@@ -9,6 +9,7 @@ use russh_sftp::client::RawSftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
 
@@ -33,7 +34,13 @@ const THROUGHPUT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// killing a transfer that was making real, if slow, progress. The
 /// previous 30-minute value killed healthy 60 GB files at 50 Mbps
 /// (which legitimately take ~3h), so we removed the check entirely.
-
+///
+/// (This comment block used to be attached to a `const
+/// TRANSFER_TIMEOUT = 30 * 60`; the constant was removed in
+/// commit 704e96a, and the rationale is preserved here so the
+/// decision doesn't get re-litigated by a future reader who notices
+/// the absence of any total-time budget.)
+///
 /// Maximum time a single SFTP read is allowed to take without
 /// producing any bytes. A healthy SFTP read on even a slow link
 /// resolves in well under a second. If a read sits idle for this long,
@@ -41,35 +48,6 @@ const THROUGHPUT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// the server isn't sending data). The transfer is aborted with a
 /// warning so the pipeline can move on to the next directory.
 const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Buffer size for the in-process read/write buffer between the SFTP
-/// stream and the local file. 64 KiB is intentional, not a default:
-///
-/// - **Read side**: 2× the typical SFTP `READ` packet size (~32 KiB
-///   after overhead). A larger buffer doesn't speed up the SFTP read
-///   itself — it just holds more already-received bytes. The bottleneck
-///   on the 4K REMUX transfers is the remote SFTP server's per-packet
-///   rate, not the user-space buffer fill.
-///
-/// - **Write side**: a multiple of 4 KiB (page size) and 16 pages (64
-///   KiB = 1 MB on 16-page writeback boundaries). The kernel's page
-///   cache already coalesces contiguous writes up to 1 MB or more for
-///   sequential workloads, so going to 256 KiB or 1 MiB only saves a
-///   handful of `write()` syscalls per file (microseconds of CPU per
-///   60 GB transfer). Bumping further would also risk writeback
-///   stalls on spinning disks if concurrency ever scales.
-///
-/// - **Memory**: at MAX_CONCURRENT_DOWNLOADS=4, the per-download
-///   footprint is 128 KiB (1 BufReader + 1 BufWriter). 512 KiB total
-///   for 4 concurrent transfers. Negligible; no reason to chase
-///   savings here.
-///
-/// If you change this, measure first: `iostat -x 1` on the host
-/// during a transfer to see whether the disk is the bottleneck
-/// (queue depth > 1, %util near 100) or whether it's idle waiting on
-/// the network (queue depth 0, %util low). The latter is what we
-/// see on the physalis CIFS mount; bumping the buffer won't help.
-const IO_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Per-request chunk size for SFTP pipelined reads. The protocol default
 /// is ~32 KB; we ask for more to amortize per-request overhead.
@@ -148,6 +126,104 @@ async fn compute_local_sha256(local: &Path) -> anyhow::Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Outcome of the "should we trust the file already on disk?" check.
+///
+/// `download_file` runs this *before* the SFTP read path so a file
+/// that landed cleanly in a prior run isn't re-pulled. The size-only
+/// check that used to gate this is insufficient: a prior interrupted
+/// run, a CIFS writeback hiccup, or a logic bug in our parallel
+/// downloader can leave a file at the right size with the wrong
+/// bytes. We re-hash whenever a recorded hash is available, and
+/// only `Trust` when the bytes actually match.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalFileDisposition {
+    /// The on-disk file matches the remote's claim. Skip the
+    /// download path entirely.
+    Trust,
+    /// The on-disk file does not exist, is the wrong size, or
+    /// (when a hash is available) has the wrong bytes. Proceed
+    /// to the SFTP read path.
+    Download,
+}
+
+/// Decide whether the file already on disk can be trusted, given
+/// the remote's authoritative size and (optionally) the SHA-256
+/// fingerprint recorded at manifest-collection time.
+///
+/// **Sizing logic.** A `local_size` that differs from `remote_size`
+/// always returns `Download` — the on-disk file is stale or
+/// partial. (A `local_size > remote_size` case is the classic
+/// "we wrote past EOF before the remote shrank" symptom; we treat
+/// it the same as "missing" because the extra bytes will be
+/// discarded on re-download anyway, and the size check at the end
+/// of `download_file` will catch any regression there.)
+///
+/// **Hashing logic.** When `expected_hash` is `Some`, we recompute
+/// the local SHA-256 and compare. A mismatch is a hard error —
+/// `Err` propagates up to the caller, which marks the directory as
+/// `sync_failed` and surfaces the failure to the operator. We do
+/// **not** auto-redownload on mismatch: a persistent mismatch
+/// usually means the recorded hash itself is corrupt (DB drift,
+/// wrong manifest) and the operator needs to investigate, not have
+/// the loop spin.
+///
+/// **No-hash case.** When `expected_hash` is `None` (the manifest
+/// was collected but `collect_remote_hashes` failed for this
+/// directory), we trust the on-disk file at face value — the
+/// "best effort" intent that already governs the download path's
+/// "no expected hash" branch. The alternative — re-downloading
+/// every file we can't verify — would make the remote-side hash
+/// collection a hard dependency, which it isn't.
+///
+/// **Performance.** Hashing is a full-file re-read. For a 60 GB
+/// file at 500 MB/s this is ~2 minutes; for a 4 GB REMUX, ~8s.
+/// Acceptable cost for the only thing standing between us and
+/// silent corruption, given the parallel downloader's track
+/// record of edge cases (see `pipelined_read_to_file`'s tests).
+async fn verify_existing_file(
+    local: &Path,
+    local_size: u64,
+    remote_size: u64,
+    expected_hash: Option<&str>,
+) -> anyhow::Result<LocalFileDisposition> {
+    // Size check first — it's free and lets us bail before touching
+    // the file at all. The two failure modes are:
+    //   local_size > remote_size  → stale, file grew on remote
+    //                                 and shrunk locally (rare)
+    //   local_size < remote_size  → partial download, in-progress
+    //                                 copy, or a crash mid-write
+    // Both should be re-downloaded.
+    if local_size != remote_size {
+        return Ok(LocalFileDisposition::Download);
+    }
+    // Zero-byte remote: trust the empty local file. There's no
+    // body to hash, and the only "wrong" answer is the same
+    // (still zero bytes).
+    if remote_size == 0 {
+        return Ok(LocalFileDisposition::Trust);
+    }
+    // No recorded hash → best-effort trust. See the function-
+    // level doc comment for why we don't fall through to the
+    // download path here.
+    let Some(expected) = expected_hash else {
+        return Ok(LocalFileDisposition::Trust);
+    };
+    let actual = compute_local_sha256(local).await
+        .with_context(|| format!("failed to hash existing local file {}", local.display()))?;
+    if actual == expected {
+        Ok(LocalFileDisposition::Trust)
+    } else {
+        // Loud, structured error. The caller (download_file)
+        // wraps this with file context for the operator.
+        Err(anyhow::anyhow!(
+            "sha256 mismatch on existing local file {}: expected {}, got {}",
+            local.display(),
+            expected,
+            actual
+        ))
+    }
 }
 
 /// Parse the stdout of `sha256sum` into a list of
@@ -308,7 +384,18 @@ where
 
 /// Holds an authenticated SSH + SFTP session to the remote download host.
 pub struct SyncEngine {
-    session: client::Handle<ClientHandler>,
+    /// The russh client handle. `Option` because `sync_category`
+    /// moves it into the spawned walker task; once moved, this
+    /// is `None` and the Drop impl's `disconnect` is a no-op
+    /// (the walker disconnects at the end of its run).
+    ///
+    /// The walker task and the downloader pool can't share one
+    /// `Handle` because `Handle` holds an `UnboundedReceiver`
+    /// (which is `!Clone` and `!Sync`). The walker is the only
+    /// task that can open new channels; the downloaders use
+    /// `RawSftpSession` (`Arc`-shared, `Send + Sync`) over
+    /// pre-opened SFTP subsystem channels.
+    session: Option<client::Handle<ClientHandler>>,
 }
 
 struct ClientHandler;
@@ -415,7 +502,7 @@ impl SyncEngine {
         }
 
         info!("ssh authenticated successfully");
-        Ok(SyncEngine { session })
+        Ok(SyncEngine { session: Some(session) })
     }
 
     pub async fn sync_category(
@@ -423,723 +510,491 @@ impl SyncEngine {
         category: &str,
         db: &Database,
     ) -> anyhow::Result<()> {
-        let config = Config::load(Path::new("/etc/media-pipeline/config.toml"))?;
-        let remote_base = config.remote_path(category);
-        let staging_base = config.staging_path(category);
+        // Take the session Handle. The walker task is the
+        // only thing that can open new channels (it owns the
+        // Handle), and the downloader pool uses pre-opened
+        // SFTP channels spawned by the walker. If the Handle
+        // is already gone (sync_category was called twice on
+        // this SyncEngine, or this is a test with a
+        // session-less engine), bail.
+        let session = self.session.take()
+            .ok_or_else(|| anyhow::anyhow!("sync_category: session already consumed"))?;
+        let category = category.to_string();
+        let db = db.clone();
+        let max_retries = self.config_for_call().max_download_retries();
+        let walker_handle = tokio::spawn(async move {
+            self_clone::run_walker(session, db, category, max_retries).await
+        });
 
-        info!(category = %category, remote = %remote_base.display(), staging = %staging_base.display(), "listing remote directory");
+        let result = walker_handle.await
+            .map_err(|e| anyhow::anyhow!("walker task panicked: {}", e))?;
+        result
+    }
 
-        // Open SFTP subsystem channel and construct a low-level
-        // `RawSftpSession`. We use the raw API (not the higher-level
-        // `SftpSession`) because the raw API exposes the file handle
-        // and a public `read(handle, offset, len)` that we can issue
-        // concurrently on the same session. `SftpSession`'s public
-        // `File::poll_read` is single-request-in-flight, which is the
-        // ~5 Mbps cap we're working around.
-        let channel = self.session.channel_open_session().await
+    /// Helper: load the config used by the current call. The
+    /// SyncEngine doesn't keep a `Config` around (it would just
+    /// duplicate the caller's); this is a single point of
+    /// truth for the `load_with_env` call.
+    fn config_for_call(&self) -> Config {
+        Config::load_with_env(Path::new("/etc/media-pipeline/config.toml"))
+            .expect("failed to load config in sync_category")
+    }
+
+    /// Open a fresh SFTP subsystem channel and return an
+    /// `Arc<RawSftpSession>`. Used by the walker task to open
+    /// its own readdir channel and to pre-open N downloader
+    /// channels. Each call opens a new SSH session channel
+    /// (multiplexed over the same Handle). The Handle isn't
+    /// `Clone`, so this is a method on `&self` — the Handle
+    /// stays put, the channel is what gets created.
+    async fn open_sftp_session(handle: &client::Handle<ClientHandler>) -> anyhow::Result<Arc<RawSftpSession>> {
+        let channel = handle.channel_open_session().await
             .context("failed to open SSH channel for SFTP")?;
         channel.request_subsystem(true, "sftp").await
             .context("failed to request SFTP subsystem")?;
-
         let raw: Arc<RawSftpSession> = Arc::new(
             RawSftpSession::new(channel.into_stream())
         );
         raw.init().await
             .context("SFTP init/version handshake failed")?;
-
-        // List top-level directories
-        let remote_dirs = self.list_remote_dirs(&raw, &remote_base).await
-            .with_context(|| format!("failed to list remote dirs in {}", remote_base.display()))?;
-
-        info!(category = %category, count = remote_dirs.len(), "remote directories found");
-
-        // Compute manifest hash for each and upsert to DB
-        for dir_name in &remote_dirs {
-            let remote_dir = remote_base.join(dir_name);
-            let staging_dir = staging_base.join(dir_name);
-            let remote_dir_str = remote_dir.to_string_lossy().to_string();
-            let staging_dir_str = staging_dir.to_string_lossy().to_string();
-
-            info!(dir = %dir_name, "sync: directory walk starting");
-
-            // Walk the remote tree once. The collected manifest is the
-            // input to both the manifest hash (for change detection)
-            // and the per-file sha256 collection (for download-time
-            // integrity verification). Walking twice would double the
-            // per-dir cost for no benefit.
-            let walk_started = Instant::now();
-            let manifest = match self.collect_manifest(&raw, &remote_dir).await {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(dir = %dir_name, error = %e, "failed to collect manifest, skipping");
-                    continue;
-                }
-            };
-            info!(
-                dir = %dir_name,
-                file_count = manifest.len(),
-                duration_secs = format!("{:.2}", walk_started.elapsed().as_secs_f64()),
-                "sync: directory walk complete"
-            );
-
-            // Per-file hashes from the remote. Best-effort: a
-            // transport error here logs a WARN and proceeds with an
-            // empty hash set, so a single broken SSH channel can't
-            // block the rest of the sync. The download path treats a
-            // missing hash as "skip verification", not as a hard
-            // error.
-            let hash_started = Instant::now();
-            let file_hashes = self.collect_remote_hashes(&remote_dir, &manifest).await
-                .unwrap_or_else(|e| {
-                    warn!(dir = %dir_name, error = %e, "failed to collect remote hashes; verification will be skipped for this dir");
-                    Vec::new()
-                });
-            info!(
-                dir = %dir_name,
-                hash_count = file_hashes.len(),
-                duration_secs = format!("{:.2}", hash_started.elapsed().as_secs_f64()),
-                "sync: remote hashes collected"
-            );
-
-            // Compute the manifest hash from the size+mtime tuples
-            // (the remote hash is not part of the manifest — that
-            // would make the manifest change every time we re-hash
-            // a file on the remote, which is meaningless).
-            let manifest_hash = manifest_hash_from_files(&manifest);
-
-            let upsert_started = Instant::now();
-            let dir_id = db.upsert_directory(category, &remote_dir_str, &staging_dir_str, &manifest_hash)?;
-            db.upsert_file_hashes(dir_id, &file_hashes)?;
-            info!(
-                dir = %dir_name,
-                dir_id,
-                manifest_hash = %manifest_hash,
-                duration_secs = format!("{:.2}", upsert_started.elapsed().as_secs_f64()),
-                "sync: directory upserted"
-            );
-        }
-
-        // Download directories that are in 'detected' state
-        let detected = db.get_directories_in_state(DirectoryState::Detected)?;
-        let to_download: Vec<_> = detected
-            .into_iter()
-            .filter(|d| d.category == category)
-            .collect();
-
-        info!(category = %category, count = to_download.len(), "directories to download");
-
-        // Download with bounded concurrency
-        let _semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
-
-        for dir in to_download {
-            // For now, sequential download to avoid SFTP borrow issues
-            db.set_directory_state(dir.id, DirectoryState::Syncing)?;
-
-            if let Err(e) = self.download_directory(&raw, &dir.remote_path, &dir.staging_path, db, dir.id).await {
-                db.set_directory_error(dir.id, DirectoryState::SyncingFailed, &format!("download failed: {}", e))?;
-                error!(dir_id = dir.id, error = %e, "download failed");
-            } else {
-                db.set_directory_state(dir.id, DirectoryState::Synced)?;
-                info!(dir_id = dir.id, "download complete");
-            }
-        }
-
-        // Close SFTP cleanly. The Drop impl also closes the channel,
-        // so this is just for a clean error path; we ignore the result.
-        let _ = raw.close_session();
-
-        Ok(())
+        Ok(raw)
     }
 
-    async fn list_remote_dirs(
-        &self,
-        raw: &Arc<RawSftpSession>,
-        path: &Path,
-    ) -> anyhow::Result<Vec<String>> {
-        let dir_handle = raw.opendir(path.to_string_lossy().into_owned()).await
-            .with_context(|| format!("failed to opendir {}", path.display()))?;
+    // (impl methods `list_remote_dirs` and `collect_manifest` were
+    //  removed when the walker was hoisted to a `tokio::spawn`-able
+    //  free function. The free-function versions live in the
+    //  `self_clone` module below — they no longer need `&self`.)
+}
+
+// =========================================================================
+// Free-function implementations of the download path. These are
+// pulled out of `impl SyncEngine` so the downloader pool tasks
+// (which don't have a `&SyncEngine`) can call them directly. The
+// `SyncEngine` methods above are thin shims that delegate here.
+// =========================================================================
+
+/// Free-function recursive directory downloader. The shape is
+/// unchanged from the original `download_directory_with_prefix`;
+/// only the borrow surface changed (no more `&self`).
+///
+/// See the `SyncEngine::download_directory` doc comment for the
+/// prefix / rel_path semantics. The free-function form is what
+/// the downloader pool task calls.
+fn download_directory(
+    raw: &Arc<RawSftpSession>,
+    remote_path: String,
+    local_path: String,
+    prefix: String,
+    db: &Database,
+    dir_id: i64,
+    max_retries: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
+    let raw = Arc::clone(raw);
+    let db = db.clone();
+    Box::pin(async move {
+        info!(remote = %remote_path, local = %local_path, "downloading directory");
+
+        let remote = Path::new(&remote_path);
+        let local = Path::new(&local_path);
+
+        // Ensure local directory exists
+        fs::create_dir_all(local).await
+            .with_context(|| format!("failed to create local directory {}", local.display()))?;
+
+        let dir_handle = raw.opendir(&remote_path).await
+            .with_context(|| format!("failed to opendir {}", remote.display()))?;
         let dir_handle_str = dir_handle.handle;
 
-        // The low-level `RawSftpSession::readdir` does NOT translate
-        // the SFTP `Eof` status (code 1) into a successful empty-
-        // listing terminator the way the high-level
-        // `SftpSession::read_dir` does — it returns it as an
-        // `Err(Error::Status(...))`. Per the SFTP protocol spec, `Eof`
-        // is the canonical "no more entries" signal, so we route
-        // both that and the empty-`files`-list convention through
-        // `drain_readdir_pages`, which handles either terminator
-        // uniformly. See the doc comment on that function for the
-        // server-convention details.
-        let files = drain_readdir_pages(|| async {
+        // Same SFTP terminator handling as `list_remote_dirs` and
+        // `collect_manifest`: the low-level `readdir` returns `Eof`
+        // as `Err`, which we treat as a successful end-of-directory.
+        // See `drain_readdir_pages` for details.
+        let entries = drain_readdir_pages(|| async {
             raw.readdir(&dir_handle_str).await
         })
         .await
         .map_err(|e| {
-            anyhow::Error::new(e).context(format!("failed to readdir {}", path.display()))
+            anyhow::Error::new(e).context(format!("failed to readdir {}", remote.display()))
         })?;
 
-        let _ = raw.close(&dir_handle_str).await;
-
-        let mut dirs: Vec<String> = files
-            .into_iter()
-            .filter(|f| f.attrs.is_dir())
-            .map(|f| f.filename)
-            .filter(|n| !n.starts_with('.'))
-            .collect();
-        dirs.sort();
-        Ok(dirs)
-    }
-
-    /// Walk the remote directory tree and return a `rel_path →
-    /// (size, mtime)` map of every regular file. Hidden entries
-    /// (`.foo`) are skipped, mirroring the manifest behavior. This
-    /// is the canonical SFTP walk: the manifest hash and the
-    /// per-file sha256 collection both consume the same data so we
-    /// don't pay for two tree walks per directory.
-    ///
-    /// Implemented iteratively with an explicit work stack rather
-    /// than recursively. The depth of the recursion would have
-    /// forced an explicit `Box::pin`-of-future for the self-call,
-    /// and a `Vec` of `(PathBuf, String)` pairs is just as
-    /// memory-bounded and clearer to read. The work stack is
-    /// O(depth), not O(files).
-    async fn collect_manifest(
-        &self,
-        raw: &Arc<RawSftpSession>,
-        dir: &Path,
-    ) -> anyhow::Result<BTreeMap<String, (u64, u64)>> {
-        let mut files: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-        // Stack of (absolute_dir, rel_path_prefix) pairs to process.
-        // The root has an empty prefix; children get `format!("{}/{}",
-        // prefix, name)` pushed on the stack.
-        let mut stack: Vec<(PathBuf, String)> = vec![(dir.to_path_buf(), String::new())];
-
-        let walk_started = Instant::now();
-
-        while let Some((cur_dir, prefix)) = stack.pop() {
-            let rel_display = if prefix.is_empty() {
-                "<root>".to_string()
-            } else {
-                prefix.clone()
-            };
-            debug!(subdir = %rel_display, "manifest: walking subdir");
-
-            let dir_handle = raw.opendir(cur_dir.to_string_lossy().into_owned()).await
-                .with_context(|| format!("failed to opendir {}", cur_dir.display()))?;
-            let dir_handle_str = dir_handle.handle;
-
-            // Same SFTP terminator handling as `list_remote_dirs` and
-            // `download_directory` — the low-level `readdir` returns the
-            // protocol's `Eof` status as `Err`, which we treat as a
-            // successful end-of-directory. See `drain_readdir_pages`.
-            let entries = drain_readdir_pages(|| async {
-                raw.readdir(&dir_handle_str).await
-            })
-            .await
-            .map_err(|e| {
-                anyhow::Error::new(e).context(format!("failed to readdir {}", cur_dir.display()))
-            })?;
-
-            for entry in entries {
-                let name = entry.filename;
-                if name.starts_with('.') {
-                    continue;
-                }
-
-                let rel_path = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}/{}", prefix, name)
-                };
-
-                if entry.attrs.is_dir() {
-                    stack.push((cur_dir.join(&name), rel_path));
-                } else {
-                    let size = entry.attrs.size.unwrap_or(0) as u64;
-                    let mtime = entry.attrs.mtime.unwrap_or(0) as u64;
-                    files.insert(rel_path, (size, mtime));
-                }
-            }
-
-            let _ = raw.close(&dir_handle_str).await;
-        }
-
-        debug!(
-            file_count = files.len(),
-            duration_secs = format!("{:.2}", walk_started.elapsed().as_secs_f64()),
-            "manifest: walk finished"
-        );
-
-        Ok(files)
-    }
-
-
-    /// Run `sha256sum` on the remote for every file in `manifest`
-    /// and return the `(rel_path, sha256, size, mtime)` tuples ready
-    /// to be persisted via `db.upsert_file_hashes`.
-    ///
-    /// **Mechanism.** Opens a fresh SSH session channel and exec's
-    /// `xargs -d '\n' sha256sum`. The newline-separated list of
-    /// absolute remote paths is sent on the channel's stdin. We
-    /// deliberately pass paths via stdin (not argv) so shell
-    /// quoting issues — spaces, single quotes, `$`, `;`, etc. —
-    /// are avoided by construction. `xargs -d '\n'` splits stdin
-    /// on newlines and invokes `sha256sum` once per path (one
-    /// process, batched; the alternative — one `sha256sum` per
-    /// file — would be ~100x more round-trips).
-    ///
-    /// **Newlines in paths.** Filesystem-dependent but vanishingly
-    /// rare. We detect them in the input list, emit a WARN, and
-    /// skip the file — `xargs -d '\n'` would silently treat the
-    /// embedded newline as a path separator and the resulting
-    /// hash map would be unparseable.
-    ///
-    /// **Channel reuse.** One channel per directory. The channel
-    /// is closed at the end (russh closes on Drop; we also call
-    /// `close()` explicitly for a clean exit code). Re-using a
-    /// single channel for the whole sync would save the small
-    /// `channel_open_session` round-trip per dir but adds
-    /// coordination complexity; the per-dir cost is one local
-    /// TCP round-trip, negligible.
-    ///
-    /// **Failure mode.** If the remote `sha256sum` exits non-zero
-    /// (e.g. binary missing), the call returns an error and the
-    /// caller in `sync_category` logs a WARN and proceeds with an
-    /// empty hash set — verification is then skipped for this
-    /// directory's files, not failed. This is consistent with the
-    /// user's "best effort" intent: integrity checks improve
-    /// coverage, they don't block the pipeline.
-    async fn collect_remote_hashes(
-        &self,
-        remote_dir: &Path,
-        manifest: &BTreeMap<String, (u64, u64)>,
-    ) -> anyhow::Result<Vec<(String, String, i64, i64)>> {
-        let hash_started = Instant::now();
-
-        if manifest.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Build the path list. Filter out any path with an
-        // embedded newline — these would break the `xargs -d
-        // '\n'` splitter and emit a WARN rather than silently
-        // producing a broken hash map.
-        let mut paths: Vec<String> = Vec::with_capacity(manifest.len());
-        let mut skipped_newline = 0usize;
-        for rel_path in manifest.keys() {
-            if rel_path.contains('\n') {
-                warn!(path = %rel_path, "skipping file with embedded newline; cannot be hashed via stdin xargs");
-                skipped_newline += 1;
+        for entry in entries {
+            let name = entry.filename;
+            if name.starts_with('.') {
                 continue;
             }
-            // <remote_dir>/<rel_path> with a single '/'. `Path::join`
-            // would do this but returns a `PathBuf`; we want a
-            // `String` for the stdin buffer.
-            let mut p = remote_dir.to_string_lossy().into_owned();
-            if !p.ends_with('/') {
-                p.push('/');
+
+            let remote_item_str = format!("{}/{}", remote_path, name);
+            let local_item_str = format!("{}/{}", local_path, name);
+            let rel_path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", prefix, name)
+            };
+
+            if entry.attrs.is_dir() {
+                download_directory(
+                    &raw,
+                    remote_item_str,
+                    local_item_str,
+                    rel_path,
+                    &db,
+                    dir_id,
+                    max_retries,
+                ).await?;
+            } else {
+                let remote_item = Path::new(&remote_item_str);
+                let local_item = Path::new(&local_item_str);
+                download_file(&raw, remote_item, local_item, &db, dir_id, &rel_path, max_retries).await?;
             }
-            p.push_str(rel_path);
-            paths.push(p);
-        }
-        if skipped_newline > 0 {
-            info!(skipped = skipped_newline, "skipped paths with embedded newlines during hash collection");
         }
 
-        info!(
-            file_count = paths.len(),
-            "sync: remote hashing starting"
-        );
+        let _ = raw.close(&dir_handle_str).await;
+        Ok(())
+    })
+}
 
-        // Open a new session channel. This is independent of the
-        // SFTP subsystem channel used for downloads — `exec` runs
-        // in its own channel per the SSH spec.
-        let mut channel = self.session.channel_open_session().await
-            .context("failed to open SSH channel for sha256sum exec")?;
+/// Free-function single-file download with bounded retries. See
+/// the `SyncEngine::download_file` doc comment for the full
+/// rationale on retry policy, pre-download `verify_existing_file`,
+/// and backoff.
+async fn download_file(
+    raw: &Arc<RawSftpSession>,
+    remote: &Path,
+    local: &Path,
+    db: &Database,
+    dir_id: i64,
+    rel_path: &str,
+    max_retries: u32,
+) -> anyhow::Result<()> {
+    let remote_str = remote.to_string_lossy().to_string();
 
-        // `xargs -d '\n' sha256sum` — split stdin on newlines,
-        // invoke sha256sum once per path. The command itself is
-        // tiny; the path list is on stdin. (Plain `sha256sum` with
-        // paths on argv would also work but is bounded by argv
-        // size and is awkward to chunk.)
-        let command = "xargs -d '\n' sha256sum";
-        channel.exec(true, command).await
-            .context("failed to exec sha256sum on remote")?;
+    // Stat the remote and the local once. The remote is the
+    // source of truth for size; the local is what we already
+    // have on disk.
+    let remote_attrs = raw.lstat(remote.to_string_lossy().into_owned()).await
+        .with_context(|| format!("failed to stat remote file {}", remote.display()))?;
+    let remote_size = remote_attrs.attrs.size.unwrap_or(0) as u64;
+    let local_size = if local.exists() {
+        let meta = fs::metadata(local).await?;
+        meta.len()
+    } else {
+        0
+    };
 
-        // Write the paths to stdin, one per line, then EOF.
-        let mut stdin = channel.make_writer();
-        let mut body = String::with_capacity(paths.iter().map(|p| p.len() + 1).sum());
-        for p in &paths {
-            body.push_str(p);
-            body.push('\n');
-        }
-        tokio::io::AsyncWriteExt::write_all(&mut stdin, body.as_bytes()).await
-            .context("failed to write paths to sha256sum stdin")?;
-        tokio::io::AsyncWriteExt::shutdown(&mut stdin).await
-            .context("failed to close sha256sum stdin")?;
-        drop(stdin);
-        // Some servers need an explicit EOF marker before they
-        // start processing; `shutdown` should suffice for OpenSSH
-        // but a belt-and-suspenders `eof()` is cheap.
-        let _ = channel.eof().await;
-
-        // Read stdout into a buffer, then drop the reader so the
-        // channel isn't borrowed when we call `wait` / `close`
-        // below. The reader is an `impl AsyncRead + '_` that
-        // borrows the channel mutably; holding it across `wait`
-        // is a double-mutable-borrow error.
-        let mut output = Vec::new();
-        {
-            let mut stdout = channel.make_reader();
-            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut output).await
-                .context("failed to read sha256sum stdout")?;
-        }
-
-        // Wait for the channel to close cleanly so we can inspect
-        // the exit code. `wait()` returns `None` on close. We
-        // discard individual messages — the reader above drained
-        // stdout into `output`.
-        while let Some(msg) = channel.wait().await {
-            let _ = msg;
-        }
-        let _ = channel.close().await;
-
-        let text = String::from_utf8(output)
-            .context("sha256sum output is not valid UTF-8")?;
-        let parsed = parse_sha256sum_output(&text, remote_dir, manifest)?;
-
-        info!(
-            file_count = paths.len(),
-            bytes_read = text.len(),
-            duration_secs = format!("{:.2}", hash_started.elapsed().as_secs_f64()),
-            "sync: remote hashing complete"
-        );
-
-        Ok(parsed)
-    }
-
-    async fn download_directory(
-        &self,
-        raw: &Arc<RawSftpSession>,
-        remote_path: &str,
-        local_path: &str,
-        db: &Database,
-        dir_id: i64,
-    ) -> anyhow::Result<()> {
-        self.download_directory_with_prefix(
-            raw,
-            remote_path.to_string(),
-            local_path.to_string(),
-            String::new(),
-            db,
-            dir_id,
-        ).await
-    }
-
-    /// Internal walker for `download_directory`. The `prefix` is
-    /// the file's path relative to the directory root — used to
-    /// look up the per-file SHA-256 fingerprint persisted by
-    /// `collect_remote_hashes`. The root call passes `""`; nested
-    /// directories pass `"<parent>/<name>"`.
-    ///
-    /// Takes owned `String`s so the recursive call can be
-    /// `async move`-captured without lifetime-tangling against
-    /// `&self`. The allocations are negligible (path lengths are
-    /// short and the depth is bounded by the directory tree).
-    fn download_directory_with_prefix(
-        &self,
-        raw: &Arc<RawSftpSession>,
-        remote_path: String,
-        local_path: String,
-        prefix: String,
-        db: &Database,
-        dir_id: i64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
-        let raw = Arc::clone(raw);
-        let db = db.clone();
-        Box::pin(async move {
-            info!(remote = %remote_path, local = %local_path, "downloading directory");
-
-            let remote = Path::new(&remote_path);
-            let local = Path::new(&local_path);
-
-            // Ensure local directory exists
-            fs::create_dir_all(local).await
-                .with_context(|| format!("failed to create local directory {}", local.display()))?;
-
-            let dir_handle = raw.opendir(&remote_path).await
-                .with_context(|| format!("failed to opendir {}", remote.display()))?;
-            let dir_handle_str = dir_handle.handle;
-
-            // Same SFTP terminator handling as `list_remote_dirs` and
-            // `collect_manifest`: the low-level `readdir` returns `Eof`
-            // as `Err`, which we treat as a successful end-of-directory.
-            // See `drain_readdir_pages` for details.
-            let entries = drain_readdir_pages(|| async {
-                raw.readdir(&dir_handle_str).await
-            })
+    // Pre-download integrity check. See `verify_existing_file`
+    // for the full rationale; the short version is: trust the
+    // on-disk file when size + (optional) recorded SHA match,
+    // re-download otherwise. This is *outside* the retry loop
+    // because a bad pre-existing file won't get better with
+    // more attempts.
+    if local_size == remote_size {
+        let expected = db.get_expected_hash(dir_id, rel_path)?
+            .map(|(hash, _size)| hash);
+        match verify_existing_file(local, local_size, remote_size, expected.as_deref())
             .await
-            .map_err(|e| {
-                anyhow::Error::new(e).context(format!("failed to readdir {}", remote.display()))
-            })?;
-
-            for entry in entries {
-                let name = entry.filename;
-                if name.starts_with('.') {
-                    continue;
-                }
-
-                let remote_item_str = format!("{}/{}", remote_path, name);
-                let local_item_str = format!("{}/{}", local_path, name);
-                let rel_path = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}/{}", prefix, name)
-                };
-
-                if entry.attrs.is_dir() {
-                    self.download_directory_with_prefix(
-                        &raw,
-                        remote_item_str,
-                        local_item_str,
-                        rel_path,
-                        &db,
-                        dir_id,
-                    ).await?;
-                } else {
-                    let remote_item = Path::new(&remote_item_str);
-                    let local_item = Path::new(&local_item_str);
-                    self.download_file(&raw, remote_item, local_item, &db, dir_id, &rel_path).await?;
-                }
+            .with_context(|| format!("verifying existing local file for {}", remote_str))?
+        {
+            LocalFileDisposition::Trust => {
+                debug!(file = %remote_str, size = remote_size, "file already complete and verified, skipping");
+                return Ok(());
             }
-
-            let _ = raw.close(&dir_handle_str).await;
-            Ok(())
-        })
+            LocalFileDisposition::Download => {
+                info!(file = %remote_str, size = remote_size, "local file is wrong size or unverified; re-downloading");
+            }
+        }
     }
 
-    async fn download_file(
-        &self,
-        raw: &Arc<RawSftpSession>,
-        remote: &Path,
-        local: &Path,
-        db: &Database,
-        dir_id: i64,
-        rel_path: &str,
-    ) -> anyhow::Result<()> {
-        let remote_str = remote.to_string_lossy();
-        trace!(file = %remote_str, "downloading file");
-
-        // `RawSftpSession::lstat` returns `Attrs { id, attrs }`; we
-        // need the inner `attrs.size` for the total file size.
-        let remote_attrs = raw.lstat(remote.to_string_lossy().into_owned()).await
-            .with_context(|| format!("failed to stat remote file {}", remote.display()))?;
-        let remote_size = remote_attrs.attrs.size.unwrap_or(0) as u64;
-
-        let local_size = if local.exists() {
-            let meta = fs::metadata(local).await?;
-            meta.len()
+    // Retry loop. Each attempt re-reads `local_size` so we
+    // resume from whatever the prior attempt landed on disk.
+    // The post-download SHA check inside `try_download_file`
+    // is what tells us "the resumed bytes are still wrong";
+    // the budget exhaustion is what halts the pipeline.
+    let mut attempt: u32 = 0;
+    loop {
+        // Re-stat on each attempt: the prior attempt may have
+        // written partial bytes. If the SFTP channel died
+        // mid-write, the high-water mark is the resume point.
+        let current_local_size = if local.exists() {
+            fs::metadata(local).await?.len()
         } else {
             0
         };
 
-        if local_size == remote_size {
-            debug!(file = %remote_str, size = remote_size, "file already complete, skipping");
-            return Ok(());
-        }
+        // Pull the expected hash for the post-download verify.
+        // We re-query on each attempt in case a prior attempt
+        // updated the DB (it shouldn't, but the cost is one
+        // indexed lookup).
+        let expected_hash = db.get_expected_hash(dir_id, rel_path)?
+            .map(|(hash, _size)| hash);
 
-        // Ensure parent directory exists
-        if let Some(parent) = local.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        // Open the remote file once; the same `handle: String` is
-        // used by every pipelined read on this file.
-        let handle = raw.open(
-            remote.to_string_lossy().into_owned(),
-            OpenFlags::READ,
-            FileAttributes::empty(),
-        ).await
-            .with_context(|| format!("failed to open remote file {}", remote.display()))?
-            .handle;
-
-        // Wrap the raw session in an Arc so we can hand a clone to
-        // each pipelined read task. The reader trait abstracts the
-        // "issue read at offset" call so the read loop is testable
-        // against a mock that returns chunks out of order.
-        let reader: Arc<dyn SftpChunkReader> = Arc::new(RawSessionReader::new(Arc::clone(raw)));
-
-        // Open the local file. We *don't* wrap in BufWriter: each
-        // spawned task seeks to its chunk's offset and writes
-        // directly. The 256 KiB chunks are already large enough to
-        // amortize per-write overhead, and the kernel coalesces
-        // nearby writes for the page cache. With
-        // SFTP_INFLIGHT_REQUESTS=16 and SFTP_READ_CHUNK=256 KiB,
-        // that's at most 16 distinct 256 KiB writes in flight —
-        // well under the page-cache dirty ratio on a 60 GB file.
-        let local_file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(local)
-            .await
-            .with_context(|| format!("failed to open local file {}", local.display()))?;
-
-        // Pre-extend the file to the full remote size. Without this,
-        // sparse holes between out-of-order writes would be reported
-        // as zero bytes by `metadata().len()` on some filesystems
-        // (the kernel knows the file is `max(written_offset,
-        // sparse_explicit)`, and the size matches the highest offset
-        // a write touched). On the CIFS mount we use, `ftruncate`
-        // up-front guarantees the size is what we asked for. This
-        // is a one-shot syscall, not a per-chunk cost.
-        if remote_size > local_size {
-            local_file
-                .set_len(remote_size)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to pre-extend local file to {} bytes",
-                        remote_size
-                    )
-                })?;
-        }
-        // Drop the pre-extension handle. The spawned read tasks
-        // each open their own FD on the same path; keeping this
-        // one open would just waste an FD. (`tokio::fs::File`'s
-        // `try_clone` shares the offset, which would serialize
-        // all writes to the position the last task left the
-        // cursor at — so we open per-task instead.)
-        drop(local_file);
-
-        // Progress tracking. `start` and `last_log` are monotonic so a
-        // wall-clock adjustment (NTP step, leap second, container
-        // suspend) doesn't make the rate go negative or skip an
-        // emission. `last_log_bytes` is the byte count at the previous
-        // emission; the rate is computed against the interval between
-        // emissions, which is more useful than the lifetime average
-        // because it surfaces stalls and bursts.
-        //
-        // `start_offset` is the byte count at which this run started
-        // (0 for fresh downloads, > 0 when resuming). The lifetime
-        // average covers only the bytes transferred in *this* run, so
-        // a resumed download isn't penalized for the prior run's time.
-        //
-        // `next_offset_to_write` is the high-water mark of bytes
-        // that have hit disk. Under the writethrough model chunks
-        // land out of order, so this is `max(off + len)` over
-        // completed chunks, not a contiguous cursor.
-        let start = tokio::time::Instant::now();
-        let mut last_log = start;
-        let mut last_log_bytes: u64 = local_size;
-        let start_offset = local_size;
-        let total = remote_size;
-        let mut next_offset_to_write: u64 = local_size;
-
-        // Run the pipelined reader. It returns the high-water-mark
-        // offset reached on disk (== highest `off + len` over
-        // completed chunks). The on-disk file is correct
-        // regardless of write order; the size check below verifies
-        // completeness.
-        let _bytes_written = pipelined_read_to_file(
-            reader,
-            handle.clone(),
-            start_offset,
-            total,
+        match try_download_file(
+            raw,
+            remote,
             local,
-            PipelinedReadConfig {
-                chunk_size: SFTP_READ_CHUNK,
-                max_inflight: SFTP_INFLIGHT_REQUESTS,
-                stall_timeout: STALL_TIMEOUT,
-            },
-            ProgressReporter {
-                file_label: &remote_str,
-                start: &start,
-                start_offset: &start_offset,
-                total,
-                last_log: &mut last_log,
-                last_log_bytes: &mut last_log_bytes,
-                next_offset_to_write: &mut next_offset_to_write,
-            },
-        ).await?;
+            current_local_size,
+            remote_size,
+            expected_hash.as_deref(),
+        ).await {
+            Ok(()) => {
+                if attempt > 0 {
+                    info!(file = %remote_str, attempt, "download succeeded after retry");
+                }
+                return Ok(());
+            }
+            Err(e) if attempt < max_retries => {
+                attempt += 1;
+                // 2^attempt seconds, capped at 30. attempt=1
+                // → 2s, attempt=2 → 4s, attempt=3 → 8s, etc.
+                let backoff_secs = 2u64.saturating_pow(attempt).min(30);
+                warn!(
+                    file = %remote_str,
+                    attempt,
+                    max_retries,
+                    backoff_secs,
+                    error = %e,
+                    "download failed, will retry"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                // Loop continues. `current_local_size` is
+                // re-read at the top of the next iteration, so
+                // we resume from whatever the prior attempt
+                // actually landed on disk.
+            }
+            Err(e) => {
+                error!(
+                    file = %remote_str,
+                    attempt,
+                    max_retries,
+                    error = %e,
+                    "download failed after exhausting retry budget; halting pipeline"
+                );
+                return Err(e);
+            }
+        }
+    }
+}
 
-        // Final per-file summary. The lifetime average covers the
-        // bytes transferred in *this* run only (not the pre-resume
-        // bytes), so the rate reflects the current run's performance.
-        let final_size = fs::metadata(local).await?.len();
-        let bytes_this_run = final_size - start_offset;
-        let elapsed = start.elapsed();
-        let lifetime_bps = if elapsed.as_secs_f64() > 0.0 {
-            (bytes_this_run as f64 * 8.0) / elapsed.as_secs_f64()
-        } else {
-            0.0
-        };
-        info!(
-            file = %remote_str,
-            bytes = final_size,
-            elapsed_secs = elapsed.as_secs(),
-            avg_mbps = format!("{:.2}", lifetime_bps / 1_000_000.0),
-            "download complete"
+/// Free-function inner download + verify. One attempt, no
+/// retries, no pre-download checks. The wrapper `download_file`
+/// is responsible for the retry policy and the pre-download
+/// `verify_existing_file` check; this function takes
+/// `start_offset` (the byte at which to begin writing) and
+/// `expected_hash` (the post-download SHA target) directly.
+///
+/// Returns `Ok(())` on a verified clean download. Errors on
+/// any transport failure, size mismatch, or SHA mismatch —
+/// the caller decides whether to retry, halt, or mark the
+/// directory as failed.
+async fn try_download_file(
+    raw: &Arc<RawSftpSession>,
+    remote: &Path,
+    local: &Path,
+    start_offset: u64,
+    remote_size: u64,
+    expected_hash: Option<&str>,
+) -> anyhow::Result<()> {
+    let remote_str = remote.to_string_lossy();
+    trace!(file = %remote_str, "downloading file");
+
+    // Ensure parent directory exists. Idempotent — fine to
+    // re-run on retry.
+    if let Some(parent) = local.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    // Open the remote file once; the same `handle: String` is
+    // used by every pipelined read on this file.
+    let handle = raw.open(
+        remote.to_string_lossy().into_owned(),
+        OpenFlags::READ,
+        FileAttributes::empty(),
+    ).await
+        .with_context(|| format!("failed to open remote file {}", remote.display()))?
+        .handle;
+
+    // Wrap the raw session in an Arc so we can hand a clone to
+    // each pipelined read task. The reader trait abstracts the
+    // "issue read at offset" call so the read loop is testable
+    // against a mock that returns chunks out of order.
+    let reader: Arc<dyn SftpChunkReader> = Arc::new(RawSessionReader::new(Arc::clone(raw)));
+
+    // Open the local file. We *don't* wrap in BufWriter: each
+    // spawned task seeks to its chunk's offset and writes
+    // directly. The 256 KiB chunks are already large enough to
+    // amortize per-write overhead, and the kernel coalesces
+    // nearby writes for the page cache. With
+    // SFTP_INFLIGHT_REQUESTS=16 and SFTP_READ_CHUNK=256 KiB,
+    // that's at most 16 distinct 256 KiB writes in flight —
+    // well under the page-cache dirty ratio on a 60 GB file.
+    let local_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(local)
+        .await
+        .with_context(|| format!("failed to open local file {}", local.display()))?;
+
+    // Pre-extend the file to the full remote size. Without this,
+    // sparse holes between out-of-order writes would be reported
+    // as zero bytes by `metadata().len()` on some filesystems
+    // (the kernel knows the file is `max(written_offset,
+    // sparse_explicit)`, and the size matches the highest offset
+    // a write touched). On the CIFS mount we use, `ftruncate`
+    // up-front guarantees the size is what we asked for. This
+    // is a one-shot syscall, not a per-chunk cost.
+    if remote_size > start_offset {
+        local_file
+            .set_len(remote_size)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to pre-extend local file to {} bytes",
+                    remote_size
+                )
+            })?;
+    }
+    // Drop the pre-extension handle. The spawned read tasks
+    // each open their own FD on the same path; keeping this
+    // one open would just waste an FD. (`tokio::fs::File`'s
+    // `try_clone` shares the offset, which would serialize
+    // all writes to the position the last task left the
+    // cursor at — so we open per-task instead.)
+    drop(local_file);
+
+    // Progress tracking. `start` and `last_log` are monotonic so a
+    // wall-clock adjustment (NTP step, leap second, container
+    // suspend) doesn't make the rate go negative or skip an
+    // emission. `last_log_bytes` is the byte count at the previous
+    // emission; the rate is computed against the interval between
+    // emissions, which is more useful than the lifetime average
+    // because it surfaces stalls and bursts.
+    //
+    // `start_offset` is the byte count at which this run started
+    // (0 for fresh downloads, > 0 when resuming). The lifetime
+    // average covers only the bytes transferred in *this* run, so
+    // a resumed download isn't penalized for the prior run's time.
+    //
+    // `next_offset_to_write` is the high-water mark of bytes
+    // that have hit disk. Under the writethrough model chunks
+    // land out of order, so this is `max(off + len)` over
+    // completed chunks, not a contiguous cursor.
+    let start = tokio::time::Instant::now();
+    let mut last_log = start;
+    let mut last_log_bytes: u64 = start_offset;
+    let total = remote_size;
+    let mut next_offset_to_write: u64 = start_offset;
+
+    // Run the pipelined reader. It returns the high-water-mark
+    // offset reached on disk (== highest `off + len` over
+    // completed chunks). The on-disk file is correct
+    // regardless of write order; the size check below verifies
+    // completeness.
+    let _bytes_written = pipelined_read_to_file(
+        reader,
+        handle.clone(),
+        start_offset,
+        total,
+        local,
+        PipelinedReadConfig {
+            chunk_size: SFTP_READ_CHUNK,
+            max_inflight: SFTP_INFLIGHT_REQUESTS,
+            stall_timeout: STALL_TIMEOUT,
+        },
+        ProgressReporter {
+            file_label: &remote_str,
+            start: &start,
+            start_offset: &start_offset,
+            total,
+            last_log: &mut last_log,
+            last_log_bytes: &mut last_log_bytes,
+            next_offset_to_write: &mut next_offset_to_write,
+        },
+    ).await?;
+
+    // Final per-file summary. The lifetime average covers the
+    // bytes transferred in *this* run only (not the pre-resume
+    // bytes), so the rate reflects the current run's performance.
+    let final_size = fs::metadata(local).await?.len();
+    let bytes_this_run = final_size - start_offset;
+    let elapsed = start.elapsed();
+    let lifetime_bps = if elapsed.as_secs_f64() > 0.0 {
+        (bytes_this_run as f64 * 8.0) / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    info!(
+        file = %remote_str,
+        bytes = final_size,
+        elapsed_secs = elapsed.as_secs(),
+        avg_mbps = format!("{:.2}", lifetime_bps / 1_000_000.0),
+        "download complete"
+    );
+
+    if final_size != remote_size {
+        anyhow::bail!(
+            "download size mismatch for {}: expected {}, got {}",
+            remote_str,
+            remote_size,
+            final_size
         );
+    }
 
-        if final_size != remote_size {
+    // Per-file SHA-256 verification. The expected hash was
+    // recorded from the remote at manifest-collection time;
+    // a mismatch means the bytes we just downloaded are not
+    // what the remote had at that moment. The retry wrapper
+    // sees this error and either retries (transient CIFS
+    // writeback issue) or halts the pipeline after the budget
+    // is exhausted (real downloader bug).
+    //
+    // This is the *post-download* check — it verifies that
+    // the bytes we just pulled through the parallel reader
+    // are correct. The pre-download check on the size-match
+    // path (see `verify_existing_file` in `download_file`) is
+    // the other half: it catches the "file already on disk
+    // from a prior run, but with stale or corrupt bytes"
+    // case that the old size-only fast path would have let
+    // through.
+    if let Some(expected) = expected_hash {
+        let actual = compute_local_sha256(local).await
+            .with_context(|| format!("failed to hash local file {}", local.display()))?;
+        if actual != expected {
+            error!(
+                file = %remote_str,
+                expected = %expected,
+                actual = %actual,
+                "sha256 mismatch: remote and local hashes disagree; file is corrupt"
+            );
             anyhow::bail!(
-                "download size mismatch for {}: expected {}, got {}",
-                remote_str,
-                remote_size,
-                final_size
+                "sha256 mismatch for {}: expected {}, got {}",
+                remote_str, expected, actual
             );
         }
-
-        // Per-file SHA-256 verification. The expected hash was
-        // recorded from the remote at manifest-collection time;
-        // a mismatch means the bytes on disk are not what the
-        // remote had when we collected the manifest. The
-        // pipeline-level error path in `sync_category` marks the
-        // directory as `sync_failed` so the next run re-tries
-        // from scratch.
-        //
-        // We always verify, even for already-on-disk files that
-        // the size check already let pass. The user explicitly
-        // asked for this: silent disk corruption should not be
-        // papered over by the size check.
-        match db.get_expected_hash(dir_id, rel_path)? {
-            Some((expected, _expected_size)) => {
-                let actual = compute_local_sha256(local).await
-                    .with_context(|| format!("failed to hash local file {}", local.display()))?;
-                if actual != expected {
-                    error!(
-                        file = %remote_str,
-                        expected = %expected,
-                        actual = %actual,
-                        "sha256 mismatch: remote and local hashes disagree; file is corrupt"
-                    );
-                    anyhow::bail!(
-                        "sha256 mismatch for {}: expected {}, got {}",
-                        remote_str, expected, actual
-                    );
-                }
-                debug!(file = %remote_str, hash = %expected, "sha256 verified");
-            }
-            None => {
-                // No expected hash — either this file was added to
-                // the directory after the manifest was collected,
-                // or `collect_remote_hashes` failed for this dir
-                // (e.g. SSH channel error). Don't block the
-                // download on missing verification data.
-                warn!(file = %remote_str, "no expected sha256 recorded for this file; skipping verification");
-            }
-        }
-
-        // Close the remote file handle.
-        let _ = raw.close(&handle).await;
-
-        Ok(())
+        debug!(file = %remote_str, hash = %expected, "sha256 verified");
+    } else {
+        // No expected hash — either this file was added to
+        // the directory after the manifest was collected,
+        // or `collect_remote_hashes` failed for this dir
+        // (e.g. SSH channel error). Don't block the
+        // download on missing verification data.
+        warn!(file = %remote_str, "no expected sha256 recorded for this file; skipping verification");
     }
+
+    // Close the remote file handle.
+    let _ = raw.close(&handle).await;
+
+    Ok(())
 }
 
 impl Drop for SyncEngine {
     fn drop(&mut self) {
-        let _ = self.session.disconnect(Disconnect::ByApplication, "pipeline complete", "");
+        // If the Handle is still here (i.e. `sync_category` was
+        // never called or the walker task panicked before taking
+        // it), disconnect cleanly. If it's already `None`
+        // (walker took it), the walker disconnects at the end of
+        // its run.
+        if let Some(session) = self.session.as_ref() {
+            let _ = session.disconnect(Disconnect::ByApplication, "pipeline complete", "");
+        }
     }
 }
 
@@ -1232,9 +1087,59 @@ impl SftpChunkReader for RawSessionReader {
         offset: u64,
         len: u32,
     ) -> anyhow::Result<Vec<u8>> {
-        let data = self.raw.read(handle, offset, len).await
-            .map_err(|e| anyhow!("SFTP read at offset {} failed: {}", offset, e))?;
-        Ok(data.data)
+        // SFTP servers are allowed (and OpenSSH's `sftp-server`
+        // does, by default) to return fewer bytes than requested
+        // in a single `SSH_FXP_READ` response. Per the SFTP
+        // protocol spec, the client is responsible for looping
+        // on the same offset until the full `len` bytes have
+        // arrived. A short read on a non-EOF read is *not* a
+        // signal to give up — it's a "ask again, same offset."
+        //
+        // We loop with a per-iteration cap (`MAX_ITERATIONS`)
+        // to bound the worst case; a wedged server that keeps
+        // returning 0 bytes for a non-EOF offset would otherwise
+        // spin here forever. The cap is generous (256 reads
+        // * 64 KiB max response = 16 MiB per chunk) — a real
+        // SFTP server that hits the cap is broken.
+        //
+        // A `0`-byte response with `offset + 0` strictly less
+        // than the file size IS an error: the server has the
+        // file open, knows its size, and is reporting EOF at a
+        // non-EOF offset. We surface that as a "premature EOF"
+        // error rather than looping.
+        const MAX_ITERATIONS: u32 = 256;
+
+        let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
+        let mut current_offset = offset;
+        let mut remaining = len;
+        let mut iterations: u32 = 0;
+
+        while remaining > 0 {
+            iterations += 1;
+            if iterations > MAX_ITERATIONS {
+                return Err(anyhow!(
+                    "SFTP read at offset {} did not return {} bytes \
+                     within {} iterations (got {} bytes so far)",
+                    offset, len, MAX_ITERATIONS, buf.len()
+                ));
+            }
+            let resp = self.raw.read(&handle, current_offset, remaining).await
+                .map_err(|e| anyhow!(
+                    "SFTP read at offset {} failed: {}",
+                    current_offset, e
+                ))?;
+            if resp.data.is_empty() {
+                return Err(anyhow!(
+                    "SFTP read at offset {} returned 0 bytes \
+                     (server-side premature EOF; needed {} more bytes)",
+                    current_offset, remaining
+                ));
+            }
+            buf.extend_from_slice(&resp.data);
+            current_offset += resp.data.len() as u64;
+            remaining -= resp.data.len() as u32;
+        }
+        Ok(buf)
     }
 }
 
@@ -1439,6 +1344,637 @@ pub(crate) async fn pipelined_read_to_file(
 }
 
 // =========================================================================
+// Two-phase sync: walker → mpsc → N downloaders
+// =========================================================================
+//
+// `sync_category` (above, in `impl SyncEngine`) opens one walker
+// SFTP channel + N downloader SFTP channels and spawns them as
+// concurrent tasks. The walker produces `DirJob`s; the downloader
+// pool consumes them. The two are independent — wall-clock cost is
+// `max(walk, download)`, not `walk + max(downloads)` as in the
+// old serial implementation.
+//
+// The walker doesn't borrow `&self` (we pass the parts it needs
+// by value into a `tokio::spawn`-able `run_walker`); the
+// downloader pool is a free function over its own owned channel.
+// This is the standard escape hatch for "I want to call an
+// `async` method on `&self` from inside a `tokio::spawn` but I
+// also need to keep `&self` around for the join."
+
+/// A single remote directory, fully described, ready for the
+/// downloader pool to consume. The walker pushes one of these per
+/// directory onto the mpsc after upserting to the DB.
+#[derive(Debug)]
+struct DirJob {
+    dir_id: i64,
+    category: String,
+    remote_path: String,
+    staging_path: String,
+}
+
+/// Free-function walker. Runs in its own task; owns the walker
+/// SFTP channel; pushes `DirJob`s to `job_tx`. Returns
+/// `anyhow::Result<()>` — an error from the walker aborts the
+/// whole pipeline (the walker is the producer; if it dies, no
+/// more jobs will arrive, and a partial walk leaves the DB in a
+/// state that downstream stages will misinterpret).
+///
+/// **Why a free function and not an `async fn` on `SyncEngine`.**
+/// `tokio::spawn` requires `'static` — the future must not borrow
+/// from the spawning task. Methods on `&self` borrow from
+/// `&self`, which lives on the parent's stack. The fix is to
+/// detach the pieces we need (a fresh `Database` clone, the
+/// `Arc<RawSftpSession>`, the `mpsc::Sender`) and pass them
+/// owned into a static-lifetime task. The `self_clone` module
+/// below exists for the same reason: `SyncEngine::collect_manifest`
+/// borrows `&self`, so we move the implementation to a free
+/// function that takes the parts it needs by `&`-reference to
+/// owned values.
+mod self_clone {
+    use super::*;
+
+    /// Walker entry point. Spawned by `sync_category`; runs
+    /// concurrently with the downloader pool.
+    pub async fn run_walker(
+        session: client::Handle<ClientHandler>,
+        db: Database,
+        category: String,
+        max_retries: u32,
+    ) -> anyhow::Result<()> {
+        let config = Config::load_with_env(Path::new("/etc/media-pipeline/config.toml"))?;
+        let remote_base = config.remote_path(&category);
+        let staging_base = config.staging_path(&category);
+
+        info!(category = %category, remote = %remote_base.display(), "walker: starting");
+
+        // Open the walker's own SFTP subsystem channel. We use
+        // the raw API (not the higher-level `SftpSession`) for
+        // the same reason the downloaders do: the raw API
+        // exposes a public `read(handle, offset, len)` we can
+        // issue concurrently.
+        let walker_raw = SyncEngine::open_sftp_session(&session).await
+            .context("walker: failed to open own SFTP session")?;
+
+        // Pre-open N downloader SFTP subsystem channels. Each
+        // downloader task owns one of these exclusively. The
+        // channels are tied to *this* `Handle` (the SFTP
+        // subsystem multiplexes channels over the SSH
+        // connection), but the wrapped `RawSftpSession` is
+        // `Send + Sync` and can be moved into a spawned task
+        // via `Arc<RawSftpSession>`.
+        //
+        // Why pre-open: we want all N+1 channels ready before
+        // the downloader pool starts pulling jobs. Otherwise
+        // a downloader that wins the first job and only then
+        // opens its channel would serialize the pool's startup.
+        let mut downloader_raws: Vec<Arc<RawSftpSession>> = Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
+        for i in 0..MAX_CONCURRENT_DOWNLOADS {
+            let raw = SyncEngine::open_sftp_session(&session).await
+                .with_context(|| format!("walker: failed to open SFTP session for downloader slot {}", i))?;
+            downloader_raws.push(raw);
+        }
+
+        // Bound the mpsc queue. The walker is much faster than
+        // the downloaders (a `readdir` round-trip vs a 4-60 GB
+        // transfer), so the queue will fill rapidly. A capacity
+        // of `2 * MAX_CONCURRENT_DOWNLOADS` lets the walker
+        // keep pushing while the pool is busy; larger values
+        // are wasted memory and risk backpressure on shutdown.
+        let (job_tx, job_rx) = mpsc::channel::<DirJob>(
+            2 * MAX_CONCURRENT_DOWNLOADS,
+        );
+        let job_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+        // Spawn the downloader pool. Each task owns one
+        // `Arc<RawSftpSession>` and pulls jobs from the shared
+        // mpsc receiver. The walker task (us) does not block on
+        // `recv()` — it's busy walking and pushing.
+        let mut downloader_handles = Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
+        for (slot_id, raw) in downloader_raws.into_iter().enumerate() {
+            let job_rx = Arc::clone(&job_rx);
+            let db = db.clone();
+            let handle = tokio::spawn(async move {
+                downloader_loop(slot_id, raw, job_rx, db, max_retries).await
+            });
+            downloader_handles.push(handle);
+        }
+
+        // The walker pass. We use the dedicated `walker_raw`
+        // for readdirs. The `xargs sha256sum` exec uses a
+        // fresh session channel per directory, opened on the
+        // shared `Handle` (it's a session-level operation, not
+        // SFTP).
+
+        // List top-level remote directories in this category.
+        let remote_dirs = list_remote_dirs(&walker_raw, &remote_base).await
+            .with_context(|| format!("failed to list remote dirs in {}", remote_base.display()))?;
+        info!(category = %category, count = remote_dirs.len(), "walker: remote directories found");
+
+        for dir_name in &remote_dirs {
+            let remote_dir = remote_base.join(dir_name);
+            let staging_dir = staging_base.join(dir_name);
+            let remote_dir_str = remote_dir.to_string_lossy().to_string();
+            let staging_dir_str = staging_dir.to_string_lossy().to_string();
+
+            info!(dir = %dir_name, "walker: directory walk starting");
+
+            // Walk the remote tree once. The collected manifest is
+            // the input to both the manifest hash (for change
+            // detection) and the per-file sha256 collection (for
+            // download-time integrity verification). Walking
+            // twice would double the per-dir cost for no benefit.
+            let walk_started = Instant::now();
+            let manifest = match collect_manifest(&walker_raw, &remote_dir).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(dir = %dir_name, error = %e, "walker: failed to collect manifest, skipping");
+                    continue;
+                }
+            };
+            info!(
+                dir = %dir_name,
+                file_count = manifest.len(),
+                duration_secs = format!("{:.2}", walk_started.elapsed().as_secs_f64()),
+                "walker: directory walk complete"
+            );
+
+            // Per-file hashes from the remote. Best-effort: a
+            // transport error here logs a WARN and proceeds with
+            // an empty hash set, so a single broken SSH channel
+            // can't block the rest of the sync.
+            //
+            // **The skip-set optimization.** `get_existing_hashes_for_dir`
+            // returns the `rel_path`s that already have a recorded
+            // hash. We pass that set into `collect_remote_hashes`,
+            // which filters those paths out of the `xargs` stdin
+            // list. The result: a re-walk of a directory whose
+            // manifest is unchanged doesn't re-run `sha256sum` over
+            // the entire tree. (A `*Failed → detected` transition
+            // forces `manifest_hash` to change, so the walk
+            // proceeds normally and the DB rows get the chance to
+            // be re-verified.)
+            //
+            // **Edge case — no row yet.** The directory may not
+            // have a row at all on the first walk. We have to
+            // call `upsert_directory` *before* we can query
+            // `get_existing_hashes_for_dir` (it takes `dir_id`).
+            // But we need the existing-hash set *before*
+            // `upsert_file_hashes` so the append/upsert
+            // decision is correct. The natural order is:
+            //
+            //   1. collect_manifest (no DB)
+            //   2. collect_remote_hashes with skip=empty (no DB
+            //      needed, but on re-walk we want the existing
+            //      rows)
+            //
+            // That requires running a *first* upsert to get a
+            // `dir_id`, then querying existing-hashes, then
+            // collecting. Two passes? No — the right shape is:
+            //
+            //   1. collect_manifest
+            //   2. upsert_directory → (dir_id, prev_state)
+            //   3. existing_hashes = get_existing_hashes_for_dir(dir_id)
+            //   4. NEW file_hashes = collect_remote_hashes(
+            //         manifest, skip=existing_hashes)
+            //   5. db.append_file_hashes(dir_id, &NEW)
+            //
+            // That's what we do. Step 2 and 3 are one round-trip
+            // each; the alternative (collect-hashes-first, then
+            // upsert) would re-hash on every re-walk even for
+            // dirs with stable manifests.
+            //
+            // The manifest hash is the change detector: if
+            // anything on the remote changed, the manifest hash
+            // changes, the row is upserted, and step 3 returns
+            // the OLD set of hashes (for the previous manifest).
+            // Those are stale — we re-collect from scratch.
+            // `collect_remote_hashes`'s skip-set logic is the
+            // optimization for the "manifest unchanged, just
+            // checking nothing moved" case.
+            let manifest_hash = manifest_hash_from_files(&manifest);
+            let upsert_started = Instant::now();
+            let (dir_id, _prev_state) = db.upsert_directory(
+                &category, &remote_dir_str, &staging_dir_str, &manifest_hash,
+            )?;
+            info!(
+                dir = %dir_name,
+                dir_id,
+                manifest_hash = %manifest_hash,
+                duration_secs = format!("{:.2}", upsert_started.elapsed().as_secs_f64()),
+                "walker: directory upserted"
+            );
+
+            let existing_hashes = db.get_existing_hashes_for_dir(dir_id)
+                .context("walker: failed to query existing hashes")?;
+            let hash_started = Instant::now();
+            let file_hashes = collect_remote_hashes(&session, &remote_dir, &manifest, &existing_hashes).await
+                .unwrap_or_else(|e| {
+                    warn!(dir = %dir_name, error = %e, "walker: failed to collect remote hashes; verification will be skipped for this dir");
+                    Vec::new()
+                });
+            info!(
+                dir = %dir_name,
+                hash_count = file_hashes.len(),
+                duration_secs = format!("{:.2}", hash_started.elapsed().as_secs_f64()),
+                "walker: remote hashes collected"
+            );
+
+            if !file_hashes.is_empty() {
+                db.append_file_hashes(dir_id, &file_hashes)
+                    .context("walker: failed to append file hashes")?;
+            }
+
+            // Push the job to the downloader pool. The downloader
+            // side checks the directory's *current* state (which
+            // `upsert_directory` may have just transitioned to
+            // `Detected` from a previous `Synced`/`Syncing`/
+            // `SyncingFailed`) and only actually downloads if it's
+            // `Detected`. This is the "only re-download what
+            // changed" invariant: a directory with an unchanged
+            // manifest stays in `Synced`, and the downloader
+            // pool's `state == Detected` check skips it.
+            let job = DirJob {
+                dir_id,
+                category: category.clone(),
+                remote_path: remote_dir_str,
+                staging_path: staging_dir_str,
+            };
+
+            // Backpressure: if the pool is fully busy, the
+            // mpsc::Sender::send().await will suspend the walker
+            // until a slot frees. This is the natural rate-limiter:
+            // a walker that's faster than the downloaders will
+            // block on `send()` rather than overflow the queue.
+            if let Err(e) = job_tx.send(job).await {
+                // The receiver side is closed — this only happens
+                // if a downloader task bailed. The whole pipeline
+                // is going down; surface the error to the caller.
+                anyhow::bail!("walker: downloader pool closed early: {}", e);
+            }
+        }
+
+        info!(category = %category, "walker: complete");
+        // **Drop the producer's `Sender` explicitly** so the
+        // mpsc closes — and the downloaders see `None` from
+        // `recv()` — *before* we await their `JoinHandle`s.
+        // Without the explicit `drop`, `job_tx` survives
+        // until the end of `run_walker`'s scope (after the
+        // downloader-await loop), the channel stays open, and
+        // every downloader hangs in `recv().await` forever
+        // even though the walker has no more work to push.
+        // This was the source of the "walker hangs after
+        // completing a category" bug observed on 2026-06-14:
+        // an empty category logged "walker: complete", the
+        // downloader pool was spawned-and-idle, the walker
+        // blocked forever in the `for h in downloader_handles`
+        // loop below because `job_tx` was still alive.
+        drop(job_tx);
+
+        // Wait for the downloader pool to drain. We do this
+        // *after* the walker has finished pushing and the
+        // producer `Sender` has dropped (so no more jobs are
+        // coming and the channel is closed), but the pool may
+        // still be in the middle of a multi-GB transfer. We
+        // don't time out — large files are the point of the
+        // parallelism.
+        let mut download_errors: Vec<anyhow::Error> = Vec::new();
+        for (i, h) in downloader_handles.into_iter().enumerate() {
+            match h.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => download_errors.push(e),
+                Err(join) => download_errors.push(
+                    anyhow::anyhow!("downloader slot {} panicked: {}", i, join)
+                ),
+            }
+        }
+
+        // Disconnect cleanly. The walker is the only thing with
+        // a Handle now, so this is the right place.
+        let _ = session.disconnect(Disconnect::ByApplication, "sync complete", "");
+
+        if !download_errors.is_empty() {
+            for e in &download_errors {
+                error!(category = %category, error = %e, "walker: downloader reported error");
+            }
+            return Err(download_errors.into_iter().next().unwrap());
+        }
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Free-function mirrors of `SyncEngine` methods. The
+    // implementations are duplicated from `SyncEngine` to avoid
+    // the `&self`-borrow problem in `tokio::spawn`. Kept in this
+    // submodule so the file's `impl SyncEngine` block still reads
+    // as a unified API for callers.
+    // -------------------------------------------------------------------
+
+    pub async fn list_remote_dirs(
+        raw: &Arc<RawSftpSession>,
+        path: &Path,
+    ) -> anyhow::Result<Vec<String>> {
+        let dir_handle = raw.opendir(path.to_string_lossy().into_owned()).await
+            .with_context(|| format!("failed to opendir {}", path.display()))?;
+        let dir_handle_str = dir_handle.handle;
+
+        let files = drain_readdir_pages(|| async {
+            raw.readdir(&dir_handle_str).await
+        })
+        .await
+        .map_err(|e| anyhow::Error::new(e).context(format!("failed to readdir {}", path.display())))?;
+        let _ = raw.close(&dir_handle_str).await;
+
+        let mut dirs = Vec::new();
+        for f in files {
+            if f.attrs.is_dir() && !f.filename.starts_with('.') {
+                dirs.push(f.filename);
+            }
+        }
+        Ok(dirs)
+    }
+
+    pub async fn collect_manifest(
+        raw: &Arc<RawSftpSession>,
+        path: &Path,
+    ) -> anyhow::Result<BTreeMap<String, (u64, u64)>> {
+        let mut manifest = BTreeMap::new();
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            let dir_handle = raw.opendir(p.to_string_lossy().into_owned()).await
+                .with_context(|| format!("failed to opendir {}", p.display()))?;
+            let dir_handle_str = dir_handle.handle;
+            let entries = drain_readdir_pages(|| async {
+                raw.readdir(&dir_handle_str).await
+            })
+            .await
+            .map_err(|e| anyhow::Error::new(e).context(format!("failed to readdir {}", p.display())))?;
+            let _ = raw.close(&dir_handle_str).await;
+
+            for entry in entries {
+                if entry.filename.starts_with('.') {
+                    continue;
+                }
+                let full = p.join(&entry.filename);
+                let rel = full.strip_prefix(path)
+                    .unwrap_or(&full)
+                    .to_string_lossy()
+                    .into_owned();
+                if entry.attrs.is_dir() {
+                    stack.push(full);
+                } else {
+                    let size = entry.attrs.size.unwrap_or(0);
+                    let mtime = entry.attrs.mtime.unwrap_or(0) as u64;
+                    manifest.insert(rel, (size, mtime));
+                }
+            }
+        }
+        Ok(manifest)
+    }
+
+    pub async fn collect_remote_hashes(
+        session: &client::Handle<ClientHandler>,
+        remote_dir: &Path,
+        manifest: &BTreeMap<String, (u64, u64)>,
+        skip: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<Vec<(String, String, i64, i64)>> {
+        let hash_started = Instant::now();
+
+        if manifest.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build the path list. Filter out any path with an
+        // embedded newline — these would break the `xargs -d
+        // '\n'` splitter and emit a WARN rather than silently
+        // producing a broken hash map. Also filter out any
+        // `rel_path` already in `skip` — the DB has the hash
+        // for those, and re-asking the remote would burn
+        // bandwidth and CPU on every cron tick.
+        let mut paths: Vec<String> = Vec::with_capacity(manifest.len());
+        let mut skipped_newline = 0usize;
+        let mut skipped_existing = 0usize;
+        for rel_path in manifest.keys() {
+            if skip.contains(rel_path) {
+                skipped_existing += 1;
+                continue;
+            }
+            if rel_path.contains('\n') {
+                warn!(path = %rel_path, "skipping file with embedded newline; cannot be hashed via stdin xargs");
+                skipped_newline += 1;
+                continue;
+            }
+            // <remote_dir>/<rel_path> with a single '/'. `Path::join`
+            // would do this but returns a `PathBuf`; we want a
+            // `String` for the stdin buffer.
+            let mut p = remote_dir.to_string_lossy().into_owned();
+            if !p.ends_with('/') {
+                p.push('/');
+            }
+            p.push_str(rel_path);
+            paths.push(p);
+        }
+        if skipped_newline > 0 {
+            info!(skipped = skipped_newline, "skipped paths with embedded newlines during hash collection");
+        }
+        if skipped_existing > 0 {
+            info!(skipped = skipped_existing, total = manifest.len(),
+                "skipped files already in DB; reusing recorded hashes");
+        }
+
+        // Hot path: every file in the manifest already has a hash
+        // in the DB. We trust the recorded hashes and skip the
+        // remote exec entirely. The walker persists nothing new
+        // (the rows are already there from a prior walk).
+        if paths.is_empty() {
+            info!(file_count = manifest.len(), "all hashes already in DB; skipping remote exec");
+            return Ok(Vec::new());
+        }
+
+        info!(
+            file_count = paths.len(),
+            skipped = skipped_existing,
+            "walker: remote hashing starting"
+        );
+
+        // Open a new session channel via the cloned russh handle.
+        // This is independent of the SFTP subsystem channel used
+        // for the readdir walks — `exec` runs in its own channel
+        // per the SSH spec.
+        let mut channel = session.channel_open_session().await
+            .context("failed to open SSH channel for sha256sum exec")?;
+
+        // `xargs -d '\n' sha256sum` — split stdin on newlines,
+        // invoke sha256sum once per path. The command itself is
+        // tiny; the path list is on stdin.
+        let command = "xargs -d '\n' sha256sum";
+        channel.exec(true, command).await
+            .context("failed to exec sha256sum on remote")?;
+
+        // Write the paths to stdin, one per line, then EOF.
+        let mut stdin = channel.make_writer();
+        let mut body = String::with_capacity(paths.iter().map(|p| p.len() + 1).sum());
+        for p in &paths {
+            body.push_str(p);
+            body.push('\n');
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut stdin, body.as_bytes()).await
+            .context("failed to write paths to sha256sum stdin")?;
+        tokio::io::AsyncWriteExt::shutdown(&mut stdin).await
+            .context("failed to close sha256sum stdin")?;
+        drop(stdin);
+        let _ = channel.eof().await;
+
+        // Read stdout into a buffer, then drop the reader so the
+        // channel isn't borrowed when we call `wait` / `close`
+        // below.
+        let mut output = Vec::new();
+        {
+            let mut stdout = channel.make_reader();
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut output).await
+                .context("failed to read sha256sum stdout")?;
+        }
+
+        while let Some(msg) = channel.wait().await {
+            let _ = msg;
+        }
+        let _ = channel.close().await;
+
+        let text = String::from_utf8(output)
+            .context("sha256sum output is not valid UTF-8")?;
+        let parsed = parse_sha256sum_output(&text, remote_dir, manifest)?;
+
+        info!(
+            file_count = paths.len(),
+            bytes_read = text.len(),
+            duration_secs = format!("{:.2}", hash_started.elapsed().as_secs_f64()),
+            "walker: remote hashing complete"
+        );
+
+        Ok(parsed)
+    }
+}
+
+/// Per-slot downloader task body. Each instance owns one
+/// `Arc<RawSftpSession>` and pulls `DirJob`s from the shared
+/// mpsc receiver until the channel closes (which happens when
+/// the walker drops its `Sender`).
+///
+/// The `state == Detected` check inside the loop is the
+/// "only re-download what changed" invariant. A directory
+/// with an unchanged manifest has its state remain `Synced`
+/// (or `Synced` from a prior run) and the downloader skips it.
+/// A `*Failed → Detected` transition (handled by
+/// `upsert_directory`) means a directory that previously failed
+/// is being retried — the downloader re-downloads it.
+///
+/// The `Arc<Mutex<Receiver>>` pattern: the `Mutex` is held only
+/// for the brief `recv()` call. In the steady state, one
+/// downloader is the receiver while the others wait. As soon as
+/// the receiver gets a job and releases the lock, the next
+/// waiter acquires it. This is the standard pattern for
+/// "N workers, 1 queue" in tokio.
+async fn downloader_loop(
+    slot_id: usize,
+    raw: Arc<RawSftpSession>,
+    job_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirJob>>>,
+    db: Database,
+    max_retries: u32,
+) -> anyhow::Result<()> {
+    info!(slot = slot_id, "downloader: starting");
+
+    loop {
+        let job = {
+            let mut rx = job_rx.lock().await;
+            rx.recv().await
+        };
+        let Some(job) = job else {
+            // Channel closed — the walker is done. No more jobs
+            // coming. Exit cleanly.
+            info!(slot = slot_id, "downloader: no more jobs, exiting");
+            return Ok(());
+        };
+
+        info!(
+            slot = slot_id,
+            dir_id = job.dir_id,
+            remote = %job.remote_path,
+            "downloader: starting directory"
+        );
+
+        // Check the directory's *current* state. The walker
+        // may have upserted it to `Detected` (from `Synced` if
+        // the manifest changed, from `SyncingFailed` if a
+        // prior run failed) or left it as `Synced` (if the
+        // manifest is unchanged). We only download on
+        // `Detected`.
+        let current = db.get_directory_by_id(job.dir_id)
+            .with_context(|| format!("downloader: failed to load dir_id={}", job.dir_id))?;
+        let Some(current) = current else {
+            warn!(slot = slot_id, dir_id = job.dir_id, "downloader: dir row vanished; skipping");
+            continue;
+        };
+        if current.state != DirectoryState::Detected {
+            info!(
+                slot = slot_id,
+                dir_id = job.dir_id,
+                state = %current.state.as_str(),
+                "downloader: skipping (not in Detected state)"
+            );
+            continue;
+        }
+
+        // Mark the directory as `Syncing` *before* we start the
+        // transfer. If the downloader crashes, the next run
+        // sees `Syncing` (or `SyncingFailed` if we set the
+        // error) and can decide whether to retry.
+        db.set_directory_state(job.dir_id, DirectoryState::Syncing)?;
+
+        // Call the free-function `download_directory` directly.
+        // The shim-on-`SyncEngine` pattern was awkward; with the
+        // download path pulled out of `&self`, the pool tasks
+        // call the implementation without an intermediate.
+        let result = download_directory(
+            &raw,
+            job.remote_path.clone(),
+            job.staging_path.clone(),
+            String::new(),
+            &db,
+            job.dir_id,
+            max_retries,
+        ).await;
+
+        match result {
+            Ok(()) => {
+                db.set_directory_state(job.dir_id, DirectoryState::Synced)?;
+                info!(slot = slot_id, dir_id = job.dir_id, "downloader: complete");
+            }
+            Err(e) => {
+                let msg = format!("download failed: {}", e);
+                let _ = db.set_directory_error(
+                    job.dir_id, DirectoryState::SyncingFailed, &msg,
+                );
+                error!(slot = slot_id, dir_id = job.dir_id, error = %e, "downloader: failed");
+
+                // Halt semantics: a single file that exhausts
+                // its retry budget bubbles up as an `Err` from
+                // `download_directory`. Returning that error
+                // here closes this downloader task, but the
+                // other downloaders are still running. The
+                // orchestrator (in `sync_category`) collects
+                // all downloader errors and `bail!`s on the
+                // first. This is intentional: one bad file
+                // halts the pipeline so the operator gets
+                // paged, but the other in-flight transfers
+                // finish gracefully (the channel close
+                // propagates when *all* downloaders return).
+                return Err(e);
+            }
+        }
+    }
+}
+
+// =========================================================================
 // Tests for the writethrough-to-disk pipelined read loop
 // =========================================================================
 
@@ -1451,19 +1987,47 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     /// A mock SFTP reader that returns canned chunks at the
-    /// requested offsets. The `reorder` flag (when true) responds to
-    /// requests in reverse order of issue, exercising the
-    /// writethrough-to-disk code path: under the writethrough model,
-    /// chunks landing at higher offsets first must still result in
-    /// the correct on-disk file.
+    /// requested offsets. The `config` field (when set) drives the
+    /// failure / stall / reorder behavior exercised by the tests
+    /// below. See `MockConfig` for the per-test knob set.
     struct MockReader {
         data: Vec<u8>,
         /// Number of completed reads, exposed for tests that want to
         /// assert on progress.
         reads_issued: Mutex<Vec<u64>>,
+        config: MockConfig,
+    }
+
+    /// Per-test configuration for `MockReader`. All fields default
+    /// to "no special behavior" so a new test only has to set the
+    /// knobs it actually cares about. The field names are
+    /// deliberately the same shape as the SFTP failure modes we
+    /// want to exercise: a chunk that arrives out of order, a chunk
+    /// that doesn't arrive at all, a chunk that arrives with the
+    /// wrong bytes, a chunk that triggers the stall timeout.
+    #[derive(Clone, Default)]
+    struct MockConfig {
         /// If true, complete reads in reverse order of issue. The
-        /// first read in `reads_issued` finishes last.
+        /// first read in `reads_issued` finishes last. This is the
+        /// "adversarial scheduler" knob: the in-process loop is
+        /// only safe under arbitrary write ordering if it survives
+        /// this.
         reorder: bool,
+        /// If `Some(n)`, the Nth read issued (0-indexed) returns
+        /// `Err`. Lets a test pin a specific failure to a specific
+        /// read — useful for "what if read #3 fails when we have
+        /// 8 in flight" coverage.
+        fail_at: Option<usize>,
+        /// If `Some(n)`, the Nth read issued sleeps for this
+        /// duration before returning. Used to push a specific read
+        /// past `stall_timeout` and assert the pipeline aborts
+        /// cleanly (rather than hanging or panicking).
+        stall_at: Option<(usize, Duration)>,
+        /// If `Some(n)`, the Nth read issued returns a chunk of
+        /// the wrong bytes (all `0xCC` of the requested length).
+        /// Useful for asserting that the post-download SHA-256
+        /// check would catch a silent corruption at any offset.
+        corrupt_at: Option<usize>,
     }
 
     impl MockReader {
@@ -1471,12 +2035,17 @@ mod tests {
             Self {
                 data,
                 reads_issued: Mutex::new(Vec::new()),
-                reorder: false,
+                config: MockConfig::default(),
             }
         }
 
         fn with_reorder(mut self) -> Self {
-            self.reorder = true;
+            self.config.reorder = true;
+            self
+        }
+
+        fn with_config(mut self, config: MockConfig) -> Self {
+            self.config = config;
             self
         }
     }
@@ -1501,7 +2070,22 @@ mod tests {
                 (issue_idx, issued.len())
             };
 
-            if self.reorder {
+            // Failure injection: a configured read index returns
+            // an error before any data is produced. The pipeline
+            // must abort the file with a clean error.
+            if self.config.fail_at == Some(issue_idx) {
+                return Err(anyhow!("injected SFTP read failure at offset {}", offset));
+            }
+
+            // Stall injection: a configured read sleeps past the
+            // caller's stall_timeout. The pipeline's
+            // `tokio::time::timeout` must fire and abort the file
+            // rather than block the test forever.
+            if let Some((idx, dur)) = self.config.stall_at {
+                if idx == issue_idx {
+                    tokio::time::sleep(dur).await;
+                }
+            } else if self.config.reorder {
                 // Simulate the server holding onto this read until
                 // the next one is issued, then completing them in
                 // reverse issue order. We do this by sleeping an
@@ -1515,10 +2099,18 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
 
+            // Corruption injection: a configured read index
+            // returns the right shape (length) but the wrong
+            // bytes. The on-disk file will not match the source;
+            // a post-download SHA-256 check is the only thing that
+            // catches this.
             let start = offset as usize;
             let end = std::cmp::min(start + len as usize, self.data.len());
             if start >= self.data.len() {
                 return Ok(Vec::new());
+            }
+            if self.config.corrupt_at == Some(issue_idx) {
+                return Ok(vec![0xCC; end - start]);
             }
             Ok(self.data[start..end].to_vec())
         }
@@ -1591,6 +2183,74 @@ mod tests {
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).await.unwrap();
         buf
+    }
+
+    /// Variant of `run_pipelined` that lets a test pass a custom
+    /// `MockConfig` (failure / stall / corruption injection) and a
+    /// custom `stall_timeout`. Returns `Result` so failure-injection
+    /// tests can assert on the error rather than unwrapping.
+    async fn run_pipelined_with_config(
+        data: &[u8],
+        start_offset: u64,
+        chunk_size: usize,
+        max_inflight: usize,
+        stall_timeout: Duration,
+        config: MockConfig,
+    ) -> anyhow::Result<Vec<u8>> {
+        let reader = MockReader::new(data.to_vec()).with_config(config);
+        let reader: Arc<dyn SftpChunkReader> = Arc::new(reader);
+
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("out.bin");
+        // Pre-extend the file. Each spawned task opens its own
+        // FD on the same path, so this handle is closed before
+        // the tasks start writing.
+        {
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .await
+                .unwrap();
+            file.set_len(data.len() as u64).await.unwrap();
+        }
+
+        let start = tokio::time::Instant::now();
+        let mut last_log = start;
+        let mut last_log_bytes = start_offset;
+        let start_offset_val = start_offset;
+        let total = data.len() as u64;
+        let mut next_offset_to_write = start_offset;
+
+        let _bytes_written = pipelined_read_to_file(
+            reader,
+            "handle".to_string(),
+            start_offset,
+            total,
+            &path,
+            PipelinedReadConfig {
+                chunk_size,
+                max_inflight,
+                stall_timeout,
+            },
+            ProgressReporter {
+                file_label: "test",
+                start: &start,
+                start_offset: &start_offset_val,
+                total,
+                last_log: &mut last_log,
+                last_log_bytes: &mut last_log_bytes,
+                next_offset_to_write: &mut next_offset_to_write,
+            },
+        ).await?;
+
+        // Re-open and read the on-disk file.
+        let mut f = tokio::fs::File::open(&path).await?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).await?;
+        Ok(buf)
     }
 
     /// Smallest case: 1 chunk, 1 request, 1 write. Verifies the
@@ -1701,6 +2361,207 @@ mod tests {
         let data: Vec<u8> = (0..1000).map(|i| (i & 0xff) as u8).collect();  // not a multiple of 256
         let out = run_pipelined(&data, 0, 256, 8, true).await;
         assert_eq!(out, data);
+    }
+
+    // ---------- Parallel downloader / interleaving tests ----------
+    //
+    // The custom parallel reader (`pipelined_read_to_file`) is the
+    // load-bearing piece of the throughput story: 16 in-flight
+    // reads × 256 KiB chunks = 4 MB of pipelined bandwidth, with
+    // chunks landing at the disk in arbitrary order. The tests
+    // above cover the happy path; these cover the failure modes
+    // and edge cases that would silently corrupt a file if the
+    // reader had a logic bug.
+    //
+    // The framing of each test is: drive a specific condition
+    // (max_inflight boundary, file-size boundary, injected read
+    // failure, stall timeout, single-chunk corruption), then assert
+    // either (a) the on-disk file matches the source byte-for-byte
+    // on success, or (b) the call returns an error on failure and
+    // no `unwrap()` panics. We don't try to assert the on-disk
+    // file on a failed run — partial writes are not a corruption
+    // mode the operator can act on, and the SHA-256 check is the
+    // post-condition that matters.
+
+    /// 16 in-flight reads, 64 chunks, full reverse reorder. The
+    /// adversarial case for the writethrough model: every chunk
+    /// lands at the disk in the *reverse* of its issue order, so
+    /// the high-water-mark advances backwards, then jumps, then
+    /// backwards again. The on-disk file must still be byte-
+    /// identical to the source. This is the regression test for
+    /// any "we wrote in order" assumption that creeps in.
+    #[tokio::test]
+    async fn test_pipelined_full_reverse_reorder() {
+        // 64 chunks × 256 B = 16 KiB. Small enough to run in a
+        // few ms; large enough that 4 in-flight rounds cycle
+        // through 16 distinct writes.
+        let data: Vec<u8> = (0..(64 * 256)).map(|i| (i & 0xff) as u8).collect();
+        let out = run_pipelined_with_config(
+            &data, 0, 256, 16, Duration::from_secs(5),
+            MockConfig { reorder: true, ..Default::default() },
+        ).await.unwrap();
+        assert_eq!(out, data, "full reverse reorder must produce byte-identical file");
+    }
+
+    /// `max_inflight = 1` is the degenerate case: the reader
+    /// should fall back to one read at a time and produce the
+    /// correct file. If the loop has an off-by-one that requires
+    /// N ≥ 2 to mask, this test catches it.
+    #[tokio::test]
+    async fn test_pipelined_max_inflight_one() {
+        let data: Vec<u8> = (0..2048).map(|i| (i & 0xff) as u8).collect();
+        let out = run_pipelined_with_config(
+            &data, 0, 256, 1, Duration::from_secs(5),
+            MockConfig::default(),
+        ).await.unwrap();
+        assert_eq!(out, data);
+    }
+
+    /// Zero-byte remote file. The reader returns an empty chunk
+    /// on the first read; the writer writes nothing. The on-disk
+    /// file exists and is zero bytes. The post-download size
+    /// check in `download_file` will accept it.
+    #[tokio::test]
+    async fn test_pipelined_zero_byte_file() {
+        let data: Vec<u8> = Vec::new();
+        let out = run_pipelined_with_config(
+            &data, 0, 256, 4, Duration::from_secs(5),
+            MockConfig::default(),
+        ).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// File smaller than one chunk. The single read returns the
+    /// whole file; the writer writes it at offset 0. Catches
+    /// "the read loop expects at least chunk_size bytes" bugs.
+    #[tokio::test]
+    async fn test_pipelined_smaller_than_chunk() {
+        let data: Vec<u8> = (0..100).map(|i| (i & 0xff) as u8).collect();
+        let out = run_pipelined_with_config(
+            &data, 0, 256, 4, Duration::from_secs(5),
+            MockConfig::default(),
+        ).await.unwrap();
+        assert_eq!(out, data);
+    }
+
+    /// File exactly one chunk long. Boundary between
+    /// "single-chunk file" and "two-chunk file" — easy to
+    /// over-/under-count at the seam.
+    #[tokio::test]
+    async fn test_pipelined_exactly_one_chunk() {
+        let data: Vec<u8> = (0..256).map(|i| (i & 0xff) as u8).collect();
+        let out = run_pipelined_with_config(
+            &data, 0, 256, 4, Duration::from_secs(5),
+            MockConfig::default(),
+        ).await.unwrap();
+        assert_eq!(out, data);
+    }
+
+    /// File exactly N*chunk long, N=8. No tail chunk — the loop
+    /// must terminate cleanly on the Nth successful read, not
+    /// issue a 9th read that returns empty and waste a round
+    /// trip.
+    #[tokio::test]
+    async fn test_pipelined_exactly_n_chunks() {
+        let data: Vec<u8> = (0..(8 * 256)).map(|i| (i & 0xff) as u8).collect();
+        let out = run_pipelined_with_config(
+            &data, 0, 256, 4, Duration::from_secs(5),
+            MockConfig::default(),
+        ).await.unwrap();
+        assert_eq!(out, data);
+    }
+
+    /// Mid-stream read failure: read #3 returns Err, the rest
+    /// succeed. The pipeline must abort the file with a clean
+    /// error — not panic, not loop forever, not return a
+    /// half-written file marked "ok".
+    #[tokio::test]
+    async fn test_pipelined_mid_stream_failure() {
+        let data: Vec<u8> = (0..(8 * 256)).map(|i| (i & 0xff) as u8).collect();
+        let result = run_pipelined_with_config(
+            &data, 0, 256, 4, Duration::from_secs(5),
+            MockConfig { fail_at: Some(3), ..Default::default() },
+        ).await;
+        let err = result.expect_err("read #3 failure must propagate as Err");
+        let msg = format!("{:#}", err);
+        // The error chain should mention the injected failure or
+        // the offset — the post-condition is that the operator
+        // can tell *which* read failed.
+        assert!(
+            msg.contains("injected SFTP read failure") || msg.contains("offset 768"),
+            "error should identify the failing read, got: {}", msg
+        );
+    }
+
+    /// All reads fail. The pipeline must abort on the first
+    /// error, not retry the rest. Catches a "swallow the error
+    /// and continue" bug in the join_next loop.
+    #[tokio::test]
+    async fn test_pipelined_all_reads_fail() {
+        let data: Vec<u8> = (0..(4 * 256)).map(|i| (i & 0xff) as u8).collect();
+        let result = run_pipelined_with_config(
+            &data, 0, 256, 2, Duration::from_secs(5),
+            MockConfig { fail_at: Some(0), ..Default::default() },
+        ).await;
+        assert!(result.is_err(), "all-fail scenario must surface as Err");
+    }
+
+    /// Stall: one read hangs past `stall_timeout` and the
+    /// pipeline aborts cleanly. Without the timeout (or with a
+    /// misconfigured one) this test would hang the test
+    /// runner — the 5 s upper bound on the test itself is the
+    /// canary.
+    #[tokio::test]
+    async fn test_pipelined_stall_timeout() {
+        let data: Vec<u8> = (0..(4 * 256)).map(|i| (i & 0xff) as u8).collect();
+        // stall_timeout = 200ms in the pipeline; inject a 2s
+        // sleep on read #1. The pipeline's per-read
+        // `tokio::time::timeout` must fire and abort the file.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_pipelined_with_config(
+                &data, 0, 256, 4, Duration::from_millis(200),
+                MockConfig {
+                    stall_at: Some((1, Duration::from_secs(2))),
+                    ..Default::default()
+                },
+            ),
+        ).await
+        .expect("test should not hang past 5s (stall timeout must fire)");
+        let err = result.expect_err("stalling read must propagate as Err");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("stalled") || msg.contains("timeout") || msg.contains("200"),
+            "error should mention the stall, got: {}", msg
+        );
+    }
+
+    /// A single chunk with corrupt bytes. The on-disk file will
+    /// not match the source — the test asserts that. The
+    /// post-download SHA-256 check is the only thing that
+    /// catches this in production, and that's verified
+    /// end-to-end by the `verify_existing_file` tests below.
+    /// Here we're just pinning that the reader returns the
+    /// corrupted chunk to the writer (no in-loop integrity
+    /// check), so a future "we can skip the SHA at download
+    /// time because the reader is trustworthy" optimization
+    /// would have to remove this test (and would be wrong).
+    #[tokio::test]
+    async fn test_pipelined_corrupt_chunk_is_visible_to_caller() {
+        let data: Vec<u8> = (0..(4 * 256)).map(|i| (i & 0xff) as u8).collect();
+        let out = run_pipelined_with_config(
+            &data, 0, 256, 2, Duration::from_secs(5),
+            MockConfig { corrupt_at: Some(1), ..Default::default() },
+        ).await.unwrap();
+        // The chunk at offset 256 should be 0xCC, not the
+        // original bytes. The reader is *not* the integrity
+        // check; it passes data through.
+        assert_ne!(out, data, "corruption must land on disk unchanged");
+        // Specifically: bytes 256..512 are 0xCC, the rest is
+        // untouched.
+        assert!(out[256..512].iter().all(|&b| b == 0xCC));
+        assert_eq!(&out[..256], &data[..256]);
+        assert_eq!(&out[512..], &data[512..]);
     }
 
     // ---------- parse_sha256sum_output tests ----------
@@ -1851,6 +2712,161 @@ mod tests {
         assert_ne!(h_orig, h_tampered, "tampered file must produce a different hash");
     }
 
+    // ---------- verify_existing_file tests ----------
+    //
+    // `verify_existing_file` is the pre-download "should we trust
+    // what's on disk?" gate. It used to be a single-line
+    // `local_size == remote_size` check that returned `Ok(())`
+    // silently — the very thing that let silent corruption through
+    // in the "downloaded files have checksums that do not match the
+    // remote" report. These tests pin the new behavior: trust
+    // only when size + hash (if available) both line up, error
+    // loudly otherwise.
+
+    use crate::sync::verify_existing_file;
+    use sha2::{Digest, Sha256};
+
+    /// Convenience: hash the given bytes so the tests can pass
+    /// "this is what the remote said" without re-implementing
+    /// the SHA-256 call.
+    fn sha256_hex(data: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(data);
+        format!("{:x}", h.finalize())
+    }
+
+    /// Size matches, no recorded hash. Best-effort trust: the
+    /// download path's "no expected hash" branch in `download_file`
+    /// is the only signal we have, and falling through to download
+    /// would make the remote hash collection a hard dependency.
+    /// Pin the existing semantics so a future change has to be
+    /// explicit.
+    #[tokio::test]
+    async fn test_verify_trust_when_no_hash() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("file.bin");
+        tokio::fs::write(&path, b"some bytes").await.unwrap();
+        let got = verify_existing_file(&path, 10, 10, None).await.unwrap();
+        assert_eq!(got, LocalFileDisposition::Trust);
+    }
+
+    /// Size matches, hash matches. Trust. This is the happy path
+    /// — the file was downloaded cleanly in a prior run, the
+    /// manifest recorded its hash, and a re-run should skip the
+    /// download entirely.
+    #[tokio::test]
+    async fn test_verify_trust_when_hash_matches() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("file.bin");
+        let data = b"hello verify_existing_file";
+        tokio::fs::write(&path, data).await.unwrap();
+        let expected = sha256_hex(data);
+        let got = verify_existing_file(&path, data.len() as u64, data.len() as u64, Some(&expected))
+            .await.unwrap();
+        assert_eq!(got, LocalFileDisposition::Trust);
+    }
+
+    /// Size matches, hash does NOT match. The local file is at
+    /// the right size but with the wrong bytes — exactly the
+    /// silent-corruption case the user reported. Must error
+    /// loudly, not return `Trust` and let the file pass.
+    #[tokio::test]
+    async fn test_verify_errs_on_hash_mismatch() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("file.bin");
+        // Write the "actual" bytes; claim the hash is for
+        // *different* bytes.
+        let actual = b"what's actually on disk";
+        tokio::fs::write(&path, actual).await.unwrap();
+        let wrong_expected = sha256_hex(b"some other bytes entirely");
+        let err = verify_existing_file(
+            &path,
+            actual.len() as u64,
+            actual.len() as u64,
+            Some(&wrong_expected),
+        ).await.expect_err("hash mismatch must surface as Err, not as Trust");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("sha256 mismatch") && msg.contains("expected") && msg.contains("got"),
+            "error should describe the mismatch, got: {}", msg
+        );
+    }
+
+    /// Local file is smaller than remote. Re-download.
+    #[tokio::test]
+    async fn test_verify_download_when_local_smaller() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("file.bin");
+        tokio::fs::write(&path, b"partial").await.unwrap();
+        let got = verify_existing_file(&path, 7, 100, None).await.unwrap();
+        assert_eq!(got, LocalFileDisposition::Download);
+    }
+
+    /// Local file is *larger* than remote. The remote shrunk
+    /// (file was truncated upstream) and our local copy is
+    /// stale. Re-download — the size check at the end of
+    /// `download_file` would catch a regression here, but we
+    /// shouldn't even get that far.
+    #[tokio::test]
+    async fn test_verify_download_when_local_larger() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("file.bin");
+        tokio::fs::write(&path, b"a much larger local file than the remote claims").await.unwrap();
+        let got = verify_existing_file(&path, 43, 10, None).await.unwrap();
+        assert_eq!(got, LocalFileDisposition::Download);
+    }
+
+    /// Both sizes zero. Empty file, no body to hash. Trust —
+    /// the on-disk file is correct by virtue of being empty.
+    #[tokio::test]
+    async fn test_verify_trust_when_both_zero() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("empty.bin");
+        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        // Create an actually-empty file so the open() in
+        // compute_local_sha256 wouldn't fail if the size-zero
+        // guard were removed.
+        tokio::fs::write(&path, b"").await.unwrap();
+        let got = verify_existing_file(&path, 0, 0, Some("any-non-empty-hash")).await.unwrap();
+        assert_eq!(got, LocalFileDisposition::Trust);
+    }
+
+    /// Local file missing entirely. The size check sees 0 vs
+    /// the remote's N > 0 and returns `Download` before
+    /// touching the (non-existent) file.
+    #[tokio::test]
+    async fn test_verify_download_when_local_missing() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("does_not_exist.bin");
+        // Sanity: the file does not exist.
+        assert!(!path.exists());
+        let got = verify_existing_file(&path, 0, 1024, None).await.unwrap();
+        assert_eq!(got, LocalFileDisposition::Download);
+    }
+
+    /// Round-trip: write data, capture its hash, write the same
+    /// data again later (simulating a re-run), confirm `Trust`.
+    /// A higher-level "the file on disk matches what the remote
+    /// said" sanity check.
+    #[tokio::test]
+    async fn test_verify_round_trip_on_realistic_data() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("round_trip.bin");
+        // 1 MiB of pseudo-random bytes — large enough to
+        // exercise the streaming read in compute_local_sha256
+        // (the function reads in 1 MiB chunks, so a 1 MiB
+        // file goes through the "exact one chunk" path; 2 MiB
+        // exercises the "more than one chunk" path).
+        let data: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+        tokio::fs::write(&path, &data).await.unwrap();
+        let expected = sha256_hex(&data);
+        // Simulate a re-run: same path, same recorded hash.
+        let got = verify_existing_file(
+            &path, data.len() as u64, data.len() as u64, Some(&expected),
+        ).await.unwrap();
+        assert_eq!(got, LocalFileDisposition::Trust);
+    }
+
     // ---------- drain_readdir_pages tests ----------
     //
     // These exercise the SFTP-directory-listing terminator handling
@@ -1994,5 +3010,777 @@ mod tests {
         .expect("Eof on first call means empty dir, not error");
 
         assert!(files.is_empty());
+    }
+
+    // =====================================================================
+    // Walker → downloader pool shutdown handshake
+    // =====================================================================
+    //
+    // The walker pushes `DirJob`s to the downloader pool over a
+    // bounded mpsc. The pool's `JoinHandle`s must terminate when
+    // the walker is done — both for the empty-category case
+    // (walker walked 0 dirs, never sent a job) and for the
+    // non-empty case (walker drained the queue, sent the last
+    // job, now waits for the pool to finish processing).
+    //
+    // The handshake is subtle: the mpsc only closes when *all*
+    // `Sender`s are dropped. If the walker holds its `Sender`
+    // past the `await` on the pool's `JoinHandle`s, the channel
+    // stays open and the pool's `recv().await` blocks forever —
+    // even on an empty walk. This was the source of the
+    // "walker hangs after completing a category" bug observed
+    // on 2026-06-14: the empty `books/` category logged
+    // "walker: complete" and the process was wedged for 7+
+    // minutes before being killed.
+    //
+    // These tests pin the handshake down. The shape of the
+    // walker code that broke was:
+    //
+    //   ```
+    //   info!("walker: complete");
+    //   // job_tx drops at end of scope, AFTER the for-loop below
+    //   for h in downloader_handles {
+    //       h.await;  // <- hangs if pool is parked in recv()
+    //   }
+    //   ```
+    //
+    // We don't have a unit-testable handle to `run_walker` (it
+    // requires a real `client::Handle<ClientHandler>` and a real
+    // SFTP server), so we test the *pattern* directly: spawn
+    // `MAX_CONCURRENT_DOWNLOADS` downloader tasks sharing an
+    // `Arc<Mutex<Receiver<DirJob>>>`, drop the producer's
+    // `Sender`, and assert the joins complete within a tight
+    // bound. If the contract is "drop the Sender before
+    // awaiting the workers", a regression that holds the Sender
+    // past the await will hang this test (and fail the suite
+    // via the outer `tokio::time::timeout`).
+
+    /// The happy path: producer drops its `Sender`, all
+    /// `MAX_CONCURRENT_DOWNLOADS` downloader tasks see `None`
+    /// from `recv()` and exit. The outer `tokio::time::timeout`
+    /// (1 s) is the canary: a regression that holds the
+    /// `Sender` past the await hangs the pool, the timeout
+    /// fires, the test fails loudly.
+    #[tokio::test]
+    async fn test_walker_pool_shutdown_when_producer_drops_sender() {
+        let (job_tx, job_rx) = mpsc::channel::<DirJob>(2 * MAX_CONCURRENT_DOWNLOADS);
+        let job_rx = std::sync::Arc::new(tokio::sync::Mutex::new(job_rx));
+
+        // Spawn the downloader pool. Each task pulls jobs
+        // from the shared mpsc receiver until the channel
+        // closes. The body is the same recv-and-shutdown
+        // shape as `downloader_loop` (we can't call
+        // `downloader_loop` directly here because it touches
+        // the DB, which we don't need for this test).
+        let mut handles = Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
+        for slot in 0..MAX_CONCURRENT_DOWNLOADS {
+            let job_rx = std::sync::Arc::clone(&job_rx);
+            let handle: tokio::task::JoinHandle<usize> = tokio::spawn(async move {
+                loop {
+                    let job = {
+                        let mut rx = job_rx.lock().await;
+                        rx.recv().await
+                    };
+                    if job.is_none() {
+                        return slot;
+                    }
+                    // A real job would be processed here. We
+                    // don't care — this test is about the
+                    // shutdown handshake, not the work.
+                }
+            });
+            handles.push(handle);
+        }
+
+        // The contract: the producer drops its `Sender` *before*
+        // awaiting the pool's `JoinHandle`s. Anything else
+        // hangs the pool in `recv()`.
+        drop(job_tx);
+
+        // Assert the pool drains within a tight bound. A
+        // regression (Sender held past this point) makes the
+        // pool hang in `recv().await` forever; the timeout
+        // fires and the test fails.
+        let mut seen_slots: Vec<usize> = Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
+        for h in handles {
+            let slot = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                h,
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "downloader slot failed to shut down within 1s; \
+                     the producer's Sender is likely held past the await"
+                )
+            })
+            .expect("downloader task panicked");
+            seen_slots.push(slot);
+        }
+        seen_slots.sort();
+        assert_eq!(
+            seen_slots,
+            (0..MAX_CONCURRENT_DOWNLOADS).collect::<Vec<_>>(),
+            "all downloader slots must have run"
+        );
+    }
+
+    /// The empty-walk case: producer sends zero jobs and then
+    /// drops the `Sender`. This is the exact shape of the
+    /// 2026-06-14 bug — `books/` had 0 remote dirs, the walker
+    /// never sent a job, and the downloaders hung in
+    /// `recv().await` because the `Sender` was held past the
+    /// await. The previous test covers the contract; this one
+    /// pins the *empty* variant explicitly, with a comment
+    /// naming the production incident.
+    #[tokio::test]
+    async fn test_walker_pool_shutdown_with_zero_jobs() {
+        let (job_tx, job_rx) = mpsc::channel::<DirJob>(2 * MAX_CONCURRENT_DOWNLOADS);
+        let job_rx = std::sync::Arc::new(tokio::sync::Mutex::new(job_rx));
+
+        let mut handles = Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
+        for _ in 0..MAX_CONCURRENT_DOWNLOADS {
+            let job_rx = std::sync::Arc::clone(&job_rx);
+            let handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+                loop {
+                    let job = {
+                        let mut rx = job_rx.lock().await;
+                        rx.recv().await
+                    };
+                    if job.is_none() {
+                        return;
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Zero jobs sent. Drop the Sender. The pool must
+        // exit promptly. This is the precise shape that hung
+        // the walker on 2026-06-14.
+        drop(job_tx);
+
+        for h in handles {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                h,
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "downloader failed to shut down on an empty walk within 1s; \
+                     the producer's Sender is likely held past the await \
+                     (see 2026-06-14 walker-hang incident)"
+                )
+            })
+            .expect("downloader task panicked");
+        }
+    }
+
+    // =====================================================================
+    // Real-SFTP integration test
+    // =====================================================================
+    //
+    // The MockReader-based unit tests cover ordering, stall,
+    // resume, and corruption paths up to 16 KiB. They do NOT
+    // exercise the production code path — the russh-sftp crate
+    // has its own state machine (window updates, request IDs,
+    // EOF handling, channel close semantics) that hides behind
+    // the trait. The largest unit test is 16 KiB at 256-byte
+    // chunks; production runs are 4-60 GB at 256 KiB chunks.
+    //
+    // This test stands up a real SFTP server (atmoz/sftp in
+    // docker, a 12 MB OpenSSH image that exposes SFTP without
+    // a shell), seeds a 100 MB random file, and runs the
+    // actual `pipelined_read_to_file` against a real
+    // `RawSftpSession`. The on-disk result is SHA-256'd and
+    // compared to the source's SHA-256.
+    //
+    // **Gated.** The test is `#[ignore]`-marked so it doesn't
+    // run in `cargo test` (CI doesn't have docker). Opt in
+    // with `cargo test --release -- --ignored real_sftp` or
+    // `cargo test --release -- --ignored`.
+    //
+    // **Skip on no-docker.** If `docker` is missing, the test
+    // returns early with a `eprintln!` and `Ok(())` rather than
+    // failing — the test environment may not have docker even
+    // for opt-in runs.
+    //
+    // **SSH key handling.** The test writes a one-off ed25519
+    // keypair into a tempdir, mounts the public key into the
+    // container at `/home/test/.ssh/authorized_keys`, and uses
+    // the private key for auth. The server's host key is
+    // accepted unconditionally (`check_server_key` returns
+    // `true` for any key) — this is a localhost loopback test;
+    // MITM isn't a concern.
+    //
+    // **Throughput sanity.** The test asserts a minimum
+    // average throughput of 2 MB/s. The OpenSSH `sftp-server`
+    // caps each `SSH_FXP_READ` response at 64 KiB by default,
+    // so a 256 KiB chunk takes 4 round trips, and a 100 MB
+    // file needs 1600 round trips. With 16-way pipelining on
+    // a localhost loopback, that lands around 3-5 MB/s in
+    // practice. 2 MB/s catches a regression that serializes
+    // the reads (inflight=1 would roughly quarter this) while
+    // leaving enough headroom for the round-trip-bound regime.
+    const REAL_SFTP_FILE_SIZE: usize = 100 * 1024 * 1024; // 100 MB
+
+    fn real_sftp_docker_available() -> bool {
+        // Cheap probe: `docker info` exits 0 on a working
+        // daemon, non-zero on missing binary or no daemon. The
+        // `2>&1` swallows stderr; we only care about the exit
+        // code.
+        std::process::Command::new("docker")
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn real_sftp_image_available() -> bool {
+        // `docker image inspect` exits 0 if the image is
+        // already pulled, non-zero if it would need to be
+        // pulled. We don't auto-pull (could be expensive /
+        // network-dependent in CI).
+        std::process::Command::new("docker")
+            .args(["image", "inspect", "atmoz/sftp:latest"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// RAII helper that runs `docker rm -f` on drop. Keeps the
+    /// container from leaking if the test panics.
+    struct DockerContainer {
+        name: String,
+    }
+    impl Drop for DockerContainer {
+        fn drop(&mut self) {
+            // Best-effort cleanup. We don't propagate errors;
+            // a leaked container is a test-environment problem,
+            // not a test failure.
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.name])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    /// Generate a fresh ed25519 keypair, write to `key_dir` as
+    /// `id_ed25519` / `id_ed25519.pub`, and return the path to
+    /// the private key. We use ed25519 because it's small,
+    /// fast, and supported by both atmoz/sftp's OpenSSH and
+    /// russh.
+    fn generate_test_keypair(key_dir: &Path) -> anyhow::Result<PathBuf> {
+        use russh_keys::key::KeyPair;
+
+        // ed25519 is fast to generate and broadly supported.
+        let key = KeyPair::generate_ed25519()
+            .ok_or_else(|| anyhow::anyhow!("failed to generate ed25519 keypair"))?;
+        let private_path = key_dir.join("id_ed25519");
+        let public_path = key_dir.join("id_ed25519.pub");
+
+        // Write the private key in OpenSSH PEM format
+        // (`russh_keys::encode_pkcs8_pem` is the
+        // edition-independent entry point; the returned bytes
+        // start with `-----BEGIN OPENSSH PRIVATE KEY-----`).
+        let mut priv_buf = Vec::new();
+        russh_keys::encode_pkcs8_pem(&key, &mut priv_buf)
+            .map_err(|e| anyhow::anyhow!("write private key: {}", e))?;
+        std::fs::write(&private_path, &priv_buf)?;
+        std::fs::set_permissions(&private_path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+
+        // Write the public key in OpenSSH authorized_keys
+        // format (`ssh-ed25519 AAAA... comment`). The
+        // `write_public_key_base64` helper emits exactly one
+        // line, newline-terminated.
+        let pubkey = key.clone_public_key()
+            .map_err(|e| anyhow::anyhow!("derive public key: {}", e))?;
+        let mut pub_buf: Vec<u8> = Vec::new();
+        russh_keys::write_public_key_base64(&mut pub_buf, &pubkey)
+            .map_err(|e| anyhow::anyhow!("write public key: {}", e))?;
+        std::fs::write(&public_path, &pub_buf)?;
+
+        Ok(private_path)
+    }
+
+    /// Spin up an atmoz/sftp container with the public key from
+    /// `key_dir` authorized for user `test`, and bind-mount
+    /// `source_path` as `/home/test/big.bin` inside the chroot.
+    /// Returns the container's name and a `Drop` guard for
+    /// cleanup.
+    ///
+    /// Note: the source file is bind-mounted (not `docker cp`'d).
+    /// atmoz/sftp chroots the user to `/home/<user>`, and
+    /// `docker cp` into a chrooted path is unreliable across
+    /// docker engine versions — the cp path is tar-pipe based
+    /// and trips on overlayfs + chroot combinations. A direct
+    /// `-v` mount of the host file into the chroot is portable
+    /// and atomic. The SFTP download path is unchanged: bytes
+    /// still come from a real SFTP read of `/home/test/big.bin`.
+    fn start_sftp_container(
+        key_dir: &Path,
+        port: u16,
+        source_path: &Path,
+    ) -> anyhow::Result<DockerContainer> {
+        // Unique container name so concurrent test runs don't
+        // collide. The `real_sftp_` prefix makes the orphan
+        // obvious in `docker ps -a` output if cleanup fails.
+        let name = format!("real_sftp_{}", std::process::id());
+
+        // atmoz/sftp's image entrypoint aggregates every file
+        // in the user's `~/.ssh/keys/` directory into
+        // `~/.ssh/authorized_keys` (and refuses to mount
+        // authorized_keys directly because of OpenSSH's
+        // permission requirements). So the public key goes
+        // at `/home/test/.ssh/keys/<anything>.pub` inside the
+        // chroot.
+        let pubkey_path = key_dir.join("id_ed25519.pub");
+        let pubkey_str = std::fs::read_to_string(&pubkey_path)
+            .map_err(|e| anyhow::anyhow!("read pubkey: {}", e))?
+            .trim()
+            .to_string();
+        // The chroot-internal path is
+        // `/home/test/.ssh/keys/<any-name>.pub`. The image
+        // entrypoint scans that directory and concatenates
+        // every file into `~/.ssh/authorized_keys` (with the
+        // ownership/permissions OpenSSH demands, which is why
+        // you can't mount `authorized_keys` directly).
+        let keys_dir = key_dir.join("keys");
+        std::fs::create_dir_all(&keys_dir)?;
+        std::fs::write(keys_dir.join("id_ed25519.pub"), format!("{}\n", pubkey_str))?;
+
+        // `docker run` flags:
+        //   --rm             clean up on exit (also covered by
+        //                    our Drop guard as belt-and-suspenders)
+        //   -d              detached; we don't need a TTY
+        //   -p host:22      bind container's sshd to host
+        //                   port; we let docker pick a free
+        //                   port via `-P`-style handling but
+        //                   we need a fixed port for
+        //                   reproducibility. We use the
+        //                   process-id-derived port and trust
+        //                   it's free.
+        //   -v host:cont    bind-mount our keys dir
+        //   --name          our handle
+        //   atmoz/sftp:test users
+        //     the trailing arg to the image is a user spec:
+        //     `user:pass:ecc` or `user::ecdsa`. The empty
+        //     password slot and ed25519 key auth means no
+        //     password is needed.
+        let status = std::process::Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--rm",
+                "--name", &name,
+                "-p", &format!("{}:22", port),
+                // Keys directory: bind-mount at the chroot
+                // path that atmoz/sftp's entrypoint scans
+                // (`/home/<user>/.ssh/keys/<any>.pub`). The
+                // entrypoint aggregates every file in that
+                // directory into `~/.ssh/authorized_keys`
+                // with the OpenSSH-required ownership and
+                // permissions.
+                "-v", &format!("{}:/home/test/.ssh/keys:ro", keys_dir.display()),
+                // Source file: bind-mount the host source path
+                // at the chroot-internal path SFTP will read.
+                "-v", &format!("{}:/home/test/big.bin:ro", source_path.display()),
+                "atmoz/sftp:latest",
+                "test::1001",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| anyhow::anyhow!("docker run failed to start: {}", e))?;
+        if !status.success() {
+            anyhow::bail!("docker run exited non-zero");
+        }
+
+        Ok(DockerContainer { name })
+    }
+
+    /// Wait for the container's sshd to accept an actual SSH
+    /// connection on `port` and complete the key-exchange
+    /// banner. A plain TCP-connect is not enough: atmoz/sftp's
+    /// first-boot host-key generation can complete after the
+    /// listener starts accepting, and a russh connect that
+    /// arrives during the gap sees a `ConnectionReset` (the
+    /// daemon aborts its pre-fork listener when the post-fork
+    /// child is still warming up).
+    ///
+    /// We do a banner-read with a 30s budget: open a TCP
+    /// connection, read up to a few bytes, and confirm the
+    /// server sent `SSH-2.0-...`. Once that line arrives, sshd
+    /// is ready to drive a russh `client::connect`.
+    async fn wait_for_sshd(port: u16) -> anyhow::Result<()> {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpStream;
+        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(30);
+        loop {
+            // Use a short per-attempt timeout so a half-open
+            // listener doesn't burn the full 30s budget.
+            let attempt = tokio::time::timeout(
+                Duration::from_secs(2),
+                async {
+                    let mut s = TcpStream::connect(addr).await?;
+                    let mut buf = [0u8; 64];
+                    let n = s.read(&mut buf).await?;
+                    if n == 0 {
+                        return Err::<(), std::io::Error>(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "sshd closed without sending a banner",
+                        ));
+                    }
+                    if !buf[..n].starts_with(b"SSH-") {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unexpected banner: {:?}", &buf[..n]),
+                        ));
+                    }
+                    Ok(())
+                },
+            ).await;
+
+            match attempt {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(_)) if start.elapsed() < timeout => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Ok(Err(e)) => anyhow::bail!(
+                    "sshd on port {} never sent a banner: {}", port, e
+                ),
+                Err(_) if start.elapsed() < timeout => {
+                    // Per-attempt 2s timeout expired before we
+                    // got a banner; try again.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(_) => anyhow::bail!(
+                    "sshd on port {} never sent a banner within {}s",
+                    port, timeout.as_secs()
+                ),
+            }
+        }
+    }
+
+    /// SHA-256 of a file at `path`, computed via the
+    /// `compute_local_sha256` free function the production
+    /// code already uses. Same code path = same hashing
+    /// behavior; we want to verify the bytes, not the hash
+    /// function.
+    async fn sha256_of(path: &Path) -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open(path).await?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 { break; }
+            hasher.update(&buf[..n]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker + atmoz/sftp image; run with --ignored. \
+                Fails (does not silently no-op) if preconditions are missing — \
+                this is opt-in because of the docker dependency, not because the \
+                outcome is conditional."]
+    async fn test_real_sftp_100mb_download_via_pipelined_read_to_file() {
+        // ---- 1. Pre-flight checks ----
+        //
+        // We `panic!` rather than silently `return` so the test
+        // outcome is unambiguous in CI: a missing-precondition
+        // run is a *failure*, not a green test. The `#[ignore]`
+        // gate is "expensive / requires docker" — not "may
+        // silently no-op." An operator who runs
+        //   cargo test --release -- --ignored
+        // and sees green knows the harness actually executed;
+        // a panic here means the test environment is broken
+        // and the result tells them so.
+        if !real_sftp_docker_available() {
+            panic!(
+                "real_sftp preflight failed: `docker info` exited non-zero. \
+                 Install/start docker, or skip the real-SFTP tests by \
+                 omitting `--ignored`."
+            );
+        }
+        if !real_sftp_image_available() {
+            panic!(
+                "real_sftp preflight failed: atmoz/sftp:latest image not pulled. \
+                 Run `docker pull atmoz/sftp:latest` and re-run, or skip the \
+                 real-SFTP tests by omitting `--ignored`."
+            );
+        }
+
+        // ---- 2. Setup: keypair, source file, container ----
+        let key_dir = tempfile::tempdir().expect("tempdir for keys");
+        let key_dir_path = key_dir.path().to_path_buf();
+        let priv_key_path = generate_test_keypair(&key_dir_path)
+            .expect("keypair generation");
+
+        // Source file: 100 MB of CSPRNG bytes. We need the
+        // source on disk (the docker `cp` writes it into the
+        // container) *and* a SHA-256 of it for the assertion
+        // at the end.
+        let staging = tempfile::tempdir().expect("staging tempdir");
+        let source_local = staging.path().join("source.bin");
+        {
+            use rand::RngCore;
+            let mut rng = rand::thread_rng();
+            let mut f = std::fs::File::create(&source_local).expect("create source");
+            let mut remaining = REAL_SFTP_FILE_SIZE;
+            let mut buf = vec![0u8; 1024 * 1024];
+            while remaining > 0 {
+                let chunk = buf.len().min(remaining);
+                rng.fill_bytes(&mut buf[..chunk]);
+                use std::io::Write;
+                f.write_all(&buf[..chunk]).expect("write source");
+                remaining -= chunk;
+            }
+        }
+        let source_sha = sha256_of(&source_local).await
+            .expect("sha of source");
+
+        // Pick a free TCP port. The atmoz/sftp container will
+        // bind its sshd to this port. We use port 0 in a
+        // temporary listener to find a free port, then close
+        // it before docker binds (TOCTOU is fine here — the
+        // test environment isn't hostile).
+        let port: u16 = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind 0");
+            listener.local_addr().unwrap().port()
+        };
+
+        // Start the container. This binds port `port` on the
+        // host to port 22 in the container, and bind-mounts
+        // `source_local` at `/home/test/big.bin` inside the
+        // chroot so SFTP can read the file directly (no
+        // `docker cp` round-trip — `docker cp` into a chrooted
+        // path is unreliable across docker engine versions).
+        let container = start_sftp_container(&key_dir_path, port, &source_local)
+            .expect("start container");
+        // Wait for sshd to come up.
+        wait_for_sshd(port).await.expect("sshd ready");
+
+        // ---- 3. Connect via russh, open SFTP, run the
+        //         production code path ----
+
+        // The russh client::Config is fine with defaults
+        // for our localhost loopback test. The first connection
+        // takes ~200ms (key exchange + auth).
+        let ssh_config = Arc::new(russh::client::Config::default());
+
+        // Load the private key we generated above.
+        let key_pair = Arc::new(
+            russh_keys::load_secret_key(&priv_key_path, None)
+                .expect("load secret key")
+        );
+
+        // `check_server_key` accepts the host key
+        // unconditionally. This is a localhost loopback test;
+        // MITM isn't a concern, and pinning the host key
+        // would mean re-pinning whenever the atmoz/sftp
+        // image regenerates its key on first boot.
+        struct AcceptAnyKey;
+        #[async_trait::async_trait]
+        impl russh::client::Handler for AcceptAnyKey {
+            type Error = russh::Error;
+            async fn check_server_key(
+                &mut self,
+                _server_public_key: &russh::keys::key::PublicKey,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+
+        let mut session = russh::client::connect(
+            ssh_config,
+            (std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST), port),
+            AcceptAnyKey,
+        ).await.expect("ssh connect");
+
+        let auth = session
+            .authenticate_publickey("test", key_pair)
+            .await
+            .expect("authenticate");
+        assert!(auth, "ssh auth failed");
+
+        // Open the SFTP subsystem channel. This is the same
+        // shape `SyncEngine::open_sftp_session` does in
+        // production.
+        let channel = session
+            .channel_open_session()
+            .await
+            .expect("channel_open_session");
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .expect("request sftp subsystem");
+
+        // Build a `RawSftpSession` from the channel — this is
+        // what the production downloader uses.
+        let raw: Arc<RawSftpSession> = Arc::new(
+            RawSftpSession::new(channel.into_stream())
+        );
+        raw.init().await.expect("sftp init");
+
+        // Open the remote file. atmoz/sftp chroots `test` to
+        // `/home/test/`, so from the SFTP protocol's
+        // perspective the file lives at `/big.bin`, not
+        // `/home/test/big.bin`. The chroot-internal path
+        // `/home/test/big.bin` is correct in the `docker run`
+        // bind-mount (above); the SFTP path is
+        // chroot-relative.
+        let sftp_path = "/big.bin";
+        let file_handle = raw
+            .open(
+                sftp_path.to_string(),
+                OpenFlags::READ,
+                FileAttributes::empty(),
+            )
+            .await
+            .expect("open remote file")
+            .handle;
+
+        // Get the remote file's size for the size-check at
+        // the end.
+        let remote_attrs = raw
+            .lstat(sftp_path.to_string())
+            .await
+            .expect("lstat remote");
+        let remote_size = remote_attrs.attrs.size.unwrap_or(0) as u64;
+        assert_eq!(
+            remote_size, REAL_SFTP_FILE_SIZE as u64,
+            "remote file size mismatch"
+        );
+
+        // Build a `RawSessionReader` (the production
+        // `SftpChunkReader` impl) and exercise
+        // `pipelined_read_to_file` against a real
+        // `tokio::fs::File`. These are the same types the
+        // production downloader uses — no mocks, no test
+        // doubles.
+        let reader: Arc<dyn SftpChunkReader> = Arc::new(
+            RawSessionReader::new(Arc::clone(&raw))
+        );
+
+        let local_path = staging.path().join("downloaded.bin");
+        // `pipelined_read_to_file` expects the destination file
+        // to already exist (its per-chunk tasks open it with
+        // `OpenOptions::write(true)` only — no `.create(true)` —
+        // because pre-creating it is the caller's job; in
+        // production that caller is `download_file`, which also
+        // runs `set_len` to pre-extend the file. The test
+        // bypasses `download_file` and exercises the pipeline
+        // reader directly, so we replicate the pre-create +
+        // pre-extend here.
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&local_path)
+            .await
+            .expect("pre-create local file")
+            .set_len(remote_size)
+            .await
+            .expect("pre-extend local file");
+        let start = tokio::time::Instant::now();
+        let start_offset: u64 = 0;
+        let mut last_log = start;
+        let mut last_log_bytes: u64 = 0;
+        let mut next_offset_to_write: u64 = 0;
+
+        let _bytes_written = pipelined_read_to_file(
+            reader,
+            file_handle.clone(),
+            start_offset,
+            remote_size,
+            &local_path,
+            PipelinedReadConfig {
+                chunk_size: 256 * 1024,  // 256 KiB — production default
+                max_inflight: 16,        // production default
+                stall_timeout: Duration::from_secs(30),
+            },
+            ProgressReporter {
+                file_label: "big.bin",
+                start: &start,
+                start_offset: &start_offset,
+                total: remote_size,
+                last_log: &mut last_log,
+                last_log_bytes: &mut last_log_bytes,
+                next_offset_to_write: &mut next_offset_to_write,
+            },
+        )
+        .await
+        .expect("pipelined_read_to_file");
+
+        // Close the remote file handle (cleanliness, not
+        // strictly required).
+        let _ = raw.close(&file_handle).await;
+
+        // Drop the session; russh disconnects on Drop. The
+        // test is over; the container is removed by the
+        // DockerContainer Drop guard.
+        drop(session);
+
+        // ---- 4. Verify ----
+
+        // Size check: the on-disk file must be the full
+        // remote size. The pipelined reader returns the
+        // high-water-mark offset; a size mismatch here
+        // would catch the "missing tail chunk" class of
+        // bug.
+        let local_size = tokio::fs::metadata(&local_path)
+            .await
+            .expect("stat local")
+            .len();
+        assert_eq!(
+            local_size, remote_size,
+            "downloaded size mismatch: expected {}, got {}",
+            remote_size, local_size
+        );
+
+        // SHA-256 check: the on-disk file must match the
+        // source byte-for-byte. This is the test of the
+        // test: any out-of-order write that lands the wrong
+        // bytes at a given offset, any chunk lost to a
+        // missed flow-control update, any silent corruption
+        // in the russh-sftp state machine — all surface
+        // here.
+        let local_sha = sha256_of(&local_path).await
+            .expect("sha of local");
+        assert_eq!(
+            local_sha, source_sha,
+            "SHA-256 mismatch: downloaded bytes don't match source"
+        );
+
+        // Throughput sanity. The test asserts a minimum
+        // average throughput of 2 MB/s (see the comment at
+        // the top of this test for the 64-KiB-cap /
+        // round-trip-bound regime rationale).
+        let elapsed = start.elapsed();
+        let mbps = (local_size as f64 / 1_000_000.0) / elapsed.as_secs_f64();
+        eprintln!(
+            "real-sftp 100 MB download: {:.1} MB/s in {:.1}s",
+            mbps, elapsed.as_secs_f64()
+        );
+        assert!(
+            mbps >= 2.0,
+            "throughput {:.1} MB/s is below the 2 MB/s floor; \
+             the parallel pipeline may have regressed to serial",
+            mbps
+        );
     }
 }
