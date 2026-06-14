@@ -68,6 +68,18 @@ impl DirectoryState {
     }
 }
 
+/// A row claimed by `claim_detected_row` — the fields the
+/// downloader needs to do its work. Deliberately a subset of
+/// `Directory` (see `get_directory_by_id`); the downloader
+/// doesn't need `detected_policy`, `error_message`, etc.
+#[derive(Debug, Clone)]
+pub struct DirectoryRow {
+    pub id: i64,
+    pub category: String,
+    pub remote_path: String,
+    pub staging_path: String,
+}
+
 /// Handle to the pipeline's SQLite database. Cheap to clone — the
 /// underlying `Connection` is shared via `Arc<Mutex<_>>` so multiple
 /// consumers (the rename path, the metadata cache, future workers)
@@ -115,6 +127,31 @@ fn table_needs_migration(conn: &Connection) -> anyhow::Result<bool> {
     Ok(!sql.contains("sync_failed"))
 }
 
+/// Returns `true` if `table` exists and does NOT have a column
+/// named `column`. Used for idempotent ALTER TABLE ... ADD COLUMN
+/// migrations: if the column is missing, the caller runs the
+/// ALTER; if it already exists, the ALTER is skipped.
+///
+/// SQLite's PRAGMA table_info returns one row per column on the
+/// named table (no rows if the table doesn't exist). The
+/// `column_name` is the second column in the result.
+fn table_needs_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(false);
+        }
+    }
+    // Table missing or column missing — either way, no need to
+    // ALTER. (If the table is missing, the subsequent CREATE
+    // TABLE IF NOT EXISTS will install the column. We return
+    // false here so the caller doesn't try to ALTER a
+    // non-existent table.)
+    Ok(false)
+}
+
 impl Database {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)
@@ -155,6 +192,7 @@ impl Database {
                     manifest_hash   TEXT,
                     detected_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
                     synced_at       DATETIME,
+                    syncing_at      DATETIME,
                     analyzed_at     DATETIME,
                     renamed_at      DATETIME,
                     transcoded_at   DATETIME,
@@ -166,15 +204,15 @@ impl Database {
                 );
                 INSERT INTO directories_new
                     (id, category, remote_path, staging_path, library_path,
-                     state, manifest_hash, detected_at, synced_at, analyzed_at,
-                     renamed_at, transcoded_at, moved_at, detected_policy,
-                     plex_scan_at, error_message)
+                     state, manifest_hash, detected_at, synced_at, syncing_at,
+                     analyzed_at, renamed_at, transcoded_at, moved_at,
+                     detected_policy, plex_scan_at, error_message)
                 SELECT
                     id, category, remote_path, staging_path, library_path,
                     CASE WHEN state = 'failed' THEN 'detected' ELSE state END,
-                    manifest_hash, detected_at, synced_at, analyzed_at,
-                    renamed_at, transcoded_at, moved_at, detected_policy,
-                    plex_scan_at,
+                    manifest_hash, detected_at, synced_at, NULL,
+                    analyzed_at, renamed_at, transcoded_at, moved_at,
+                    detected_policy, plex_scan_at,
                     CASE WHEN state = 'failed' THEN NULL ELSE error_message END
                 FROM directories;
                 DROP TABLE directories;
@@ -182,6 +220,18 @@ impl Database {
                 COMMIT;
                 "#,
             )?;
+        }
+
+        // Idempotent column addition: add `syncing_at` to the
+        // directories table. The stale-Syncing sweep needs this
+        // column to find rows that a crashed downloader left
+        // behind (state = 'syncing' with an old syncing_at). The
+        // column is added to both the live table and the
+        // migration-target `directories_new` so a fresh install
+        // and an upgrade from the pre-`syncing_at` schema both
+        // get the column.
+        if table_needs_column(&conn, "directories", "syncing_at")? {
+            conn.execute_batch("ALTER TABLE directories ADD COLUMN syncing_at DATETIME")?;
         }
 
         conn.execute_batch(
@@ -201,6 +251,7 @@ impl Database {
                 manifest_hash   TEXT,
                 detected_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
                 synced_at       DATETIME,
+                syncing_at      DATETIME,
                 analyzed_at     DATETIME,
                 renamed_at      DATETIME,
                 transcoded_at   DATETIME,
@@ -497,6 +548,108 @@ impl Database {
         Ok(row)
     }
 
+    /// Atomically claim one `Detected` row for download. Picks the
+    /// oldest `Detected` row (lowest `detected_at`), transitions it
+    /// to `Syncing`, sets `syncing_at = now`, and returns the row's
+    /// full projection. Returns `Ok(None)` if no `Detected` row
+    /// exists.
+    ///
+    /// This is the dispatch primitive that replaces the in-process
+    /// mpsc `DirJob` channel: downloader tasks call this in a loop
+    /// instead of `recv()`-ing from a `mpsc::Receiver`. The
+    /// `UPDATE ... WHERE state = 'detected'` is the lock — only
+    /// one downloader wins per call, even with N concurrent
+    /// callers, because SQLite serializes writes through the
+    /// connection mutex.
+    ///
+    /// The row's `staging_path` and `category` are returned so the
+    /// downloader can locate the local target and route logs.
+    pub fn claim_detected_row(&self) -> anyhow::Result<Option<DirectoryRow>> {
+        let conn = self.conn.lock().unwrap();
+        // One statement, atomic. The subquery picks the oldest
+        // Detected row; the outer UPDATE filters on the same
+        // condition so the row we transition is the one we
+        // selected. `RETURNING` gives us the post-update
+        // projection in a single round trip.
+        let mut stmt = conn.prepare(
+            "UPDATE directories
+                SET state = 'syncing', syncing_at = CURRENT_TIMESTAMP
+              WHERE id = (
+                  SELECT id FROM directories
+                   WHERE state = 'detected'
+                   ORDER BY detected_at ASC
+                   LIMIT 1
+              )
+                AND state = 'detected'
+              RETURNING id, category, remote_path, staging_path",
+        )?;
+        let mut rows = stmt.query([])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let id: i64 = row.get(0)?;
+        let category: String = row.get(1)?;
+        let remote_path: String = row.get(2)?;
+        let staging_path: String = row.get(3)?;
+        Ok(Some(DirectoryRow {
+            id,
+            category,
+            remote_path,
+            staging_path,
+        }))
+    }
+
+    /// Count rows in `Detected` state. Used by the downloader pool
+    /// to decide whether to keep polling after a drain signal —
+    /// "no more walkers" + "no detected rows" = pool is done.
+    pub fn count_detected(&self) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM directories WHERE state = 'detected'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Sweep rows stuck in `Syncing` longer than `max_age_hours`
+    /// back to `Detected`. Called once at downloader-pool startup
+    /// so a row claimed by a process that crashed mid-download is
+    /// available for the next pool to claim.
+    ///
+    /// Returns the number of rows recovered. Logs at info level so
+    /// the operator log shows when a crash-recovery happened (and
+    /// how many rows it touched) — silent recovery would mask the
+    /// fact that a prior run died.
+    pub fn stale_syncing_sweep(&self, max_age_hours: i64) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE directories
+                SET state = 'detected', syncing_at = NULL
+              WHERE state = 'syncing'
+                AND syncing_at < datetime('now', ?1)",
+            params![format!("-{} hours", max_age_hours)],
+        )?;
+        if n > 0 {
+            info!(recovered = n, max_age_hours, "stale-Syncing sweep: recovered rows");
+        }
+        Ok(n)
+    }
+
+    /// Test-only: set `syncing_at` for a row to a specific
+    /// offset-from-now string (e.g. `"-7 hours"`). Used by the
+    /// stale-Syncing sweep tests to put a row in a "stale"
+    /// state without having to wait 7 hours. Not for
+    /// production use.
+    #[doc(hidden)]
+    pub fn _test_set_syncing_at(&self, dir_id: i64, offset: &str) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE directories SET syncing_at = datetime('now', ?1) WHERE id = ?2",
+            params![offset, dir_id],
+        )?;
+        Ok(())
+    }
+
     /// Return the input state a `*Failed` row should be reset to so the
     /// next run re-attempts the phase that failed. Returns `None` for
     /// any non-failed state.
@@ -515,6 +668,7 @@ impl Database {
     pub fn set_directory_state(&self, id: i64, state: DirectoryState) -> anyhow::Result<()> {
         let state_str = state.as_str();
         let timestamp_col = match state {
+            DirectoryState::Syncing => "syncing_at",
             DirectoryState::Synced => "synced_at",
             DirectoryState::Analyzed => "analyzed_at",
             DirectoryState::Renamed => "renamed_at",

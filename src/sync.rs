@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 use russh::{client, keys::key::PublicKey, ChannelId, Disconnect};
@@ -9,7 +9,7 @@ use russh_sftp::client::RawSftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use sha2::{Digest, Sha256};
 use tokio::fs;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
 
@@ -383,19 +383,50 @@ where
 }
 
 /// Holds an authenticated SSH + SFTP session to the remote download host.
+///
+/// In the DB-driven-dispatch refactor (2026-06-14), the SyncEngine
+/// is a per-pipeline-run object, not a per-category one. It owns:
+/// - The russh client `Handle` (wrapped in a `Mutex` because
+///   `Handle` is `!Sync` and we need to share it between the
+///   walker task — briefly, to open exec channels for
+///   `xargs sha256sum` — and the engine's `Drop` impl).
+/// - A pre-allocated walker SFTP channel (the walker borrows an
+///   `Arc<RawSftpSession>` clone for the duration of one
+///   category's walk).
+/// - The downloader pool, which owns N pre-allocated SFTP
+///   channels and runs N downloader tasks that claim rows from
+///   the DB.
+///
+/// The previous design (pre-2026-06-14) consumed the session
+/// inside `sync_category` to move it into the walker task. That
+/// had two costs: (1) the downloader pool was scoped to a single
+/// category and couldn't help with the next category's work, and
+/// (2) the "drop `job_tx` before awaiting the pool's
+/// `JoinHandle`s" contract was load-bearing and easy to break.
+/// Both costs are gone: the pool lives for the whole pipeline
+/// run, and the dispatch is a DB query (atomic UPDATE) rather
+/// than an mpsc close.
 pub struct SyncEngine {
-    /// The russh client handle. `Option` because `sync_category`
-    /// moves it into the spawned walker task; once moved, this
-    /// is `None` and the Drop impl's `disconnect` is a no-op
-    /// (the walker disconnects at the end of its run).
-    ///
-    /// The walker task and the downloader pool can't share one
-    /// `Handle` because `Handle` holds an `UnboundedReceiver`
-    /// (which is `!Clone` and `!Sync`). The walker is the only
-    /// task that can open new channels; the downloaders use
-    /// `RawSftpSession` (`Arc`-shared, `Send + Sync`) over
-    /// pre-opened SFTP subsystem channels.
-    session: Option<client::Handle<ClientHandler>>,
+    /// The russh `Handle`. `Handle` is `!Sync` (it holds an
+    /// `UnboundedReceiver`), so we wrap it in a `Mutex` to share
+    /// it across the walker task and the engine's `Drop` impl.
+    /// The walker's critical section is short (one
+    /// `channel_open_session` call); the downloader pool never
+    /// touches the Handle.
+    handle: Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>,
+    /// Pre-allocated SFTP subsystem channel for the walker.
+    /// The walker borrows an `Arc<RawSftpSession>` clone for
+    /// the duration of one category's walk. Categories are
+    /// walked sequentially, so a single walker channel is
+    /// sufficient.
+    walker_channel: Arc<RawSftpSession>,
+    /// The downloader pool. Lives for the whole pipeline run.
+    /// Spawned at `SyncEngine::new` time, drained at
+    /// `drain_pool().await` time.
+    pool: DownloaderPool,
+    /// The pool's background task. `None` after `drain_pool`
+    /// has consumed it.
+    pool_join: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
 struct ClientHandler;
@@ -467,7 +498,10 @@ impl client::Handler for ClientHandler {
 }
 
 impl SyncEngine {
-    pub async fn new(config: &Config) -> anyhow::Result<Self> {
+    /// Connect to the remote, open the walker + N downloader SFTP
+    /// channels, and spawn the downloader pool. The returned
+    /// `SyncEngine` is ready to call `sync_category(...)` on.
+    pub async fn new(config: &Config, db: &Database) -> anyhow::Result<Self> {
         let ssh_config = client::Config::default();
         let ssh_config = std::sync::Arc::new(ssh_config);
 
@@ -502,51 +536,118 @@ impl SyncEngine {
         }
 
         info!("ssh authenticated successfully");
-        Ok(SyncEngine { session: Some(session) })
+
+        // Sweep rows stuck in `Syncing` from a prior crashed
+        // run. The pool is about to spawn; doing the sweep
+        // first means the pool can immediately claim any
+        // recovered rows. 6h threshold (env-tunable via
+        // STALE_SYNCING_HOURS in the future; hard-coded for
+        // now) is safe for a single-instance deployment.
+        let recovered = db.stale_syncing_sweep(6)?;
+        if recovered > 0 {
+            info!(recovered, "SyncEngine: stale-Syncing sweep recovered rows at startup");
+        }
+
+        // Wrap the Handle in a Mutex so the walker task can
+        // borrow it briefly to open exec channels. The walker
+        // is the only long-lived consumer of the Handle; the
+        // downloader pool uses pre-allocated channels and never
+        // touches the Handle directly.
+        let handle = Arc::new(tokio::sync::Mutex::new(session));
+
+        // Pre-open the walker's SFTP subsystem channel. The
+        // walker borrows a clone of this `Arc` for the
+        // duration of one category's walk.
+        let walker_channel = {
+            let h = handle.lock().await;
+            Self::open_sftp_session(&h).await
+                .context("failed to open walker SFTP channel")?
+        };
+
+        // Pre-open N downloader SFTP subsystem channels. Each
+        // downloader task owns one of these exclusively for
+        // the lifetime of the pool.
+        let mut downloader_channels: Vec<Arc<RawSftpSession>> =
+            Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
+        for i in 0..MAX_CONCURRENT_DOWNLOADS {
+            let raw = {
+                let h = handle.lock().await;
+                Self::open_sftp_session(&h).await
+                    .with_context(|| format!("failed to open SFTP channel for downloader slot {}", i))?
+            };
+            downloader_channels.push(raw);
+        }
+
+        // Construct the downloader pool. The pool's background
+        // task is spawned inside `DownloaderPool::new`.
+        let max_retries = config.max_download_retries();
+        let poll_interval = Duration::from_millis(200);
+        let pool = DownloaderPool::new(downloader_channels, max_retries, poll_interval);
+        let pool_join = Some(pool.spawn(db.clone()));
+
+        Ok(SyncEngine {
+            handle,
+            walker_channel,
+            pool,
+            pool_join,
+        })
     }
 
     pub async fn sync_category(
-        &mut self,
+        &self,
         category: &str,
         db: &Database,
     ) -> anyhow::Result<()> {
-        // Take the session Handle. The walker task is the
-        // only thing that can open new channels (it owns the
-        // Handle), and the downloader pool uses pre-opened
-        // SFTP channels spawned by the walker. If the Handle
-        // is already gone (sync_category was called twice on
-        // this SyncEngine, or this is a test with a
-        // session-less engine), bail.
-        let session = self.session.take()
-            .ok_or_else(|| anyhow::anyhow!("sync_category: session already consumed"))?;
+        // Borrow the walker channel and the Handle-Mutex for
+        // the duration of one category's walk. The Handle is
+        // not moved; the walker task locks it briefly to open
+        // exec channels. Multiple `sync_category` calls in
+        // parallel are not safe (the walker channel is a
+        // single Arc), so the caller must serialize them —
+        // `run_sync` does this with a sequential `for` loop.
+        let walker_channel = Arc::clone(&self.walker_channel);
+        let handle = Arc::clone(&self.handle);
         let category = category.to_string();
         let db = db.clone();
-        let max_retries = self.config_for_call().max_download_retries();
+        let max_retries = self.pool.config.max_retries;
         let walker_handle = tokio::spawn(async move {
-            self_clone::run_walker(session, db, category, max_retries).await
+            self_clone::run_walker(handle, walker_channel, db, category, max_retries).await
         });
 
-        let result = walker_handle.await
-            .map_err(|e| anyhow::anyhow!("walker task panicked: {}", e))?;
-        result
+        walker_handle.await
+            .map_err(|e| anyhow::anyhow!("walker task panicked: {}", e))?
     }
 
-    /// Helper: load the config used by the current call. The
-    /// SyncEngine doesn't keep a `Config` around (it would just
-    /// duplicate the caller's); this is a single point of
-    /// truth for the `load_with_env` call.
-    fn config_for_call(&self) -> Config {
-        Config::load_with_env(Path::new("/etc/media-pipeline/config.toml"))
-            .expect("failed to load config in sync_category")
+    /// Signal the downloader pool to drain. After this returns,
+    /// no walkers will spawn (caller's responsibility), the pool
+    /// has processed every `Detected` row that exists, and the
+    /// pool's background task has exited.
+    ///
+    /// Idempotent: a second call is a no-op (the pool is
+    /// already drained).
+    pub async fn drain_pool(&mut self) -> anyhow::Result<()> {
+        // Take the join handle out of the option so a second
+        // call is a no-op.
+        let Some(join) = self.pool_join.take() else {
+            return Ok(());
+        };
+        // Signal the pool. The watcher's `changed()` will wake
+        // any downloader parked in `select!` waiting for work.
+        self.pool.signal_drain();
+        match join.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(join) => Err(anyhow::anyhow!("pool task panicked: {}", join)),
+        }
     }
 
     /// Open a fresh SFTP subsystem channel and return an
-    /// `Arc<RawSftpSession>`. Used by the walker task to open
-    /// its own readdir channel and to pre-open N downloader
-    /// channels. Each call opens a new SSH session channel
-    /// (multiplexed over the same Handle). The Handle isn't
-    /// `Clone`, so this is a method on `&self` — the Handle
-    /// stays put, the channel is what gets created.
+    /// `Arc<RawSftpSession>`. Used at `SyncEngine::new` time to
+    /// pre-open the walker + downloader channels. Each call
+    /// opens a new SSH session channel (multiplexed over the
+    /// same Handle). The Handle isn't `Clone`, so this is a
+    /// static method that takes a `&Handle` — the Handle stays
+    /// put, the channel is what gets created.
     async fn open_sftp_session(handle: &client::Handle<ClientHandler>) -> anyhow::Result<Arc<RawSftpSession>> {
         let channel = handle.channel_open_session().await
             .context("failed to open SSH channel for SFTP")?;
@@ -559,11 +660,6 @@ impl SyncEngine {
             .context("SFTP init/version handshake failed")?;
         Ok(raw)
     }
-
-    // (impl methods `list_remote_dirs` and `collect_manifest` were
-    //  removed when the walker was hoisted to a `tokio::spawn`-able
-    //  free function. The free-function versions live in the
-    //  `self_clone` module below — they no longer need `&self`.)
 }
 
 // =========================================================================
@@ -985,16 +1081,147 @@ async fn try_download_file(
     Ok(())
 }
 
+// =========================================================================
+// DownloaderPool: long-lived pool of N downloader tasks that claim
+// rows from the DB and download them.
+// =========================================================================
+//
+// In the DB-driven-dispatch refactor (2026-06-14), the pool lives
+// for the entire pipeline run, not for a single category. It owns
+// N pre-allocated SFTP subsystem channels (one per downloader
+// task) and uses an atomic `UPDATE ... WHERE state = 'detected'`
+// (`db.claim_detected_row`) as the dispatch primitive. There is
+// no in-process mpsc; the DB *is* the work queue.
+//
+// Shutdown: the pool is signaled via a `watch::Sender<bool>` when
+// no more walkers are coming. Each downloader's loop checks the
+// signal: if set AND the DB has no `Detected` rows, the downloader
+// exits. The pool's background `JoinHandle` is awaited via
+// `SyncEngine::drain_pool`.
+
+struct PoolConfig {
+    max_retries: u32,
+    poll_interval: Duration,
+}
+
+pub struct DownloaderPool {
+    /// Pre-opened SFTP subsystem channels, one per downloader
+    /// task. Each downloader task owns one of these for the
+    /// lifetime of the pool; it never opens new channels.
+    downloader_channels: Vec<Arc<RawSftpSession>>,
+    /// Drain signal: set to `true` when no more walkers are
+    /// coming. The downloaders observe this in their main loop.
+    drain_signal: Arc<watch::Sender<bool>>,
+    /// Pool configuration. Kept here so the spawn call can pass
+    /// the per-task settings (poll interval, retry budget) to
+    /// each downloader.
+    config: PoolConfig,
+}
+
+impl DownloaderPool {
+    fn new(
+        downloader_channels: Vec<Arc<RawSftpSession>>,
+        max_retries: u32,
+        poll_interval: Duration,
+    ) -> Self {
+        let (drain_tx, _drain_rx) = watch::channel(false);
+        Self {
+            downloader_channels,
+            drain_signal: Arc::new(drain_tx),
+            config: PoolConfig { max_retries, poll_interval },
+        }
+    }
+
+    /// Signal the pool to drain. Each downloader will exit
+    /// once the DB has no more `Detected` rows. The signal is
+    /// idempotent.
+    fn signal_drain(&self) {
+        // `send` only updates if the value changed; ignore the
+        // error (the only way it fails is if there are no
+        // receivers, which means the pool is already gone).
+        let _ = self.drain_signal.send(true);
+    }
+
+    /// Spawn N downloader tasks. Returns the `JoinHandle` of
+    /// the *aggregator* task that awaits all N downloaders; the
+    /// caller awaits this handle in `drain_pool`.
+    fn spawn(&self, db: Database) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let drain_rx = self.drain_signal.subscribe();
+        let poll_interval = self.config.poll_interval;
+        let max_retries = self.config.max_retries;
+        // Clone the channels — `Arc<RawSftpSession>` is cheap
+        // to clone (just an Arc bump). This lets us keep
+        // `self.downloader_channels` for any future inspection
+        // (e.g. operator log of how many slots the pool has).
+        let channels = self.downloader_channels.clone();
+        tokio::spawn(async move {
+            // Spawn N downloader tasks. Each owns one channel.
+            let mut set = JoinSet::new();
+            for (slot_id, raw) in channels.into_iter().enumerate() {
+                let drain_rx = drain_rx.clone();
+                let db = db.clone();
+                set.spawn(async move {
+                    downloader_loop(slot_id, raw, db, drain_rx, max_retries, poll_interval).await
+                });
+            }
+            // Await all downloader tasks. If any returns Err,
+            // propagate the first one.
+            let mut first_err: Option<anyhow::Error> = None;
+            while let Some(res) = set.join_next().await {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                    Err(join) => {
+                        if first_err.is_none() {
+                            first_err = Some(anyhow::anyhow!("downloader task panicked: {}", join));
+                        }
+                    }
+                }
+            }
+            match first_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        })
+    }
+}
+
 impl Drop for SyncEngine {
     fn drop(&mut self) {
-        // If the Handle is still here (i.e. `sync_category` was
-        // never called or the walker task panicked before taking
-        // it), disconnect cleanly. If it's already `None`
-        // (walker took it), the walker disconnects at the end of
-        // its run.
-        if let Some(session) = self.session.as_ref() {
-            let _ = session.disconnect(Disconnect::ByApplication, "pipeline complete", "");
+        // Best-effort drain signal. If `drain_pool().await` was
+        // not called by the caller, signal anyway so the pool
+        // can exit if it's still alive. We can't `.await` in
+        // `Drop`, so the pool's background task will see the
+        // signal on its next iteration and exit on its own.
+        // The actual `await` of the pool's `JoinHandle` is in
+        // `drain_pool`, which the caller is expected to invoke.
+        if let Some(join) = self.pool_join.take() {
+            self.pool.signal_drain();
+            // We *abort* the join rather than wait — Drop is
+            // synchronous. The pool's task sees the drain
+            // signal, finishes its current download (or aborts),
+            // and exits. If the process is exiting, the OS
+            // cleans up; if the caller is moving on to a new
+            // SyncEngine, they shouldn't have a pool still
+            // running from a previous engine.
+            join.abort();
         }
+        // Disconnect the SSH Handle. This is best-effort
+        // because `Drop` is synchronous and we can't `.await`
+        // the lock; if the walker is still running, the
+        // disconnect races with its exec channel use. The
+        // walker will see the disconnect on its next operation
+        // and surface an error, which is the right outcome.
+        if let Ok(handle) = self.handle.try_lock() {
+            let _ = handle.disconnect(Disconnect::ByApplication, "pipeline complete", "");
+        }
+        // If the try_lock fails, the walker is mid-exec. We
+        // skip the disconnect; the Handle drops at end of
+        // scope, which also closes the TCP connection.
     }
 }
 
@@ -1361,30 +1588,18 @@ pub(crate) async fn pipelined_read_to_file(
 // `async` method on `&self` from inside a `tokio::spawn` but I
 // also need to keep `&self` around for the join."
 
-/// A single remote directory, fully described, ready for the
-/// downloader pool to consume. The walker pushes one of these per
-/// directory onto the mpsc after upserting to the DB.
-#[derive(Debug)]
-struct DirJob {
-    dir_id: i64,
-    category: String,
-    remote_path: String,
-    staging_path: String,
-}
-
 /// Free-function walker. Runs in its own task; owns the walker
-/// SFTP channel; pushes `DirJob`s to `job_tx`. Returns
+/// SFTP channel; writes per-directory rows to the DB. Returns
 /// `anyhow::Result<()>` — an error from the walker aborts the
-/// whole pipeline (the walker is the producer; if it dies, no
-/// more jobs will arrive, and a partial walk leaves the DB in a
-/// state that downstream stages will misinterpret).
+/// whole pipeline (a partial walk leaves the DB in a state that
+/// downstream stages will misinterpret).
 ///
 /// **Why a free function and not an `async fn` on `SyncEngine`.**
 /// `tokio::spawn` requires `'static` — the future must not borrow
 /// from the spawning task. Methods on `&self` borrow from
 /// `&self`, which lives on the parent's stack. The fix is to
 /// detach the pieces we need (a fresh `Database` clone, the
-/// `Arc<RawSftpSession>`, the `mpsc::Sender`) and pass them
+/// `Arc<RawSftpSession>`, the `Arc<Mutex<Handle>>`) and pass them
 /// owned into a static-lifetime task. The `self_clone` module
 /// below exists for the same reason: `SyncEngine::collect_manifest`
 /// borrows `&self`, so we move the implementation to a free
@@ -1393,13 +1608,30 @@ struct DirJob {
 mod self_clone {
     use super::*;
 
-    /// Walker entry point. Spawned by `sync_category`; runs
-    /// concurrently with the downloader pool.
+    /// Walker entry point. Spawned by `SyncEngine::sync_category`;
+    /// walks one category, writes per-directory rows to the DB,
+    /// and returns when the walk is complete.
+    ///
+    /// **No downloader dispatch.** The walker does not push jobs
+    /// to a pool — it only writes rows. The downloader pool,
+    /// which lives for the entire pipeline run, claims rows
+    /// independently via `db.claim_detected_row()`. The walker
+    /// and the downloaders communicate through the DB, not
+    /// through an mpsc.
+    ///
+    /// **Borrowed channel.** The walker uses the
+    /// pre-allocated `walker_channel` (cloned `Arc<RawSftpSession>`)
+    /// for readdirs. The Handle is borrowed through a Mutex
+    /// (`handle: Arc<tokio::sync::Mutex<Handle>>`); the
+    /// walker locks it briefly to open exec channels for
+    /// `xargs sha256sum`. The downloader pool never touches the
+    /// Handle.
     pub async fn run_walker(
-        session: client::Handle<ClientHandler>,
+        handle: Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>,
+        walker_channel: Arc<RawSftpSession>,
         db: Database,
         category: String,
-        max_retries: u32,
+        _max_retries: u32,
     ) -> anyhow::Result<()> {
         let config = Config::load_with_env(Path::new("/etc/media-pipeline/config.toml"))?;
         let remote_base = config.remote_path(&category);
@@ -1407,66 +1639,13 @@ mod self_clone {
 
         info!(category = %category, remote = %remote_base.display(), "walker: starting");
 
-        // Open the walker's own SFTP subsystem channel. We use
-        // the raw API (not the higher-level `SftpSession`) for
-        // the same reason the downloaders do: the raw API
-        // exposes a public `read(handle, offset, len)` we can
-        // issue concurrently.
-        let walker_raw = SyncEngine::open_sftp_session(&session).await
-            .context("walker: failed to open own SFTP session")?;
-
-        // Pre-open N downloader SFTP subsystem channels. Each
-        // downloader task owns one of these exclusively. The
-        // channels are tied to *this* `Handle` (the SFTP
-        // subsystem multiplexes channels over the SSH
-        // connection), but the wrapped `RawSftpSession` is
-        // `Send + Sync` and can be moved into a spawned task
-        // via `Arc<RawSftpSession>`.
-        //
-        // Why pre-open: we want all N+1 channels ready before
-        // the downloader pool starts pulling jobs. Otherwise
-        // a downloader that wins the first job and only then
-        // opens its channel would serialize the pool's startup.
-        let mut downloader_raws: Vec<Arc<RawSftpSession>> = Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
-        for i in 0..MAX_CONCURRENT_DOWNLOADS {
-            let raw = SyncEngine::open_sftp_session(&session).await
-                .with_context(|| format!("walker: failed to open SFTP session for downloader slot {}", i))?;
-            downloader_raws.push(raw);
-        }
-
-        // Bound the mpsc queue. The walker is much faster than
-        // the downloaders (a `readdir` round-trip vs a 4-60 GB
-        // transfer), so the queue will fill rapidly. A capacity
-        // of `2 * MAX_CONCURRENT_DOWNLOADS` lets the walker
-        // keep pushing while the pool is busy; larger values
-        // are wasted memory and risk backpressure on shutdown.
-        let (job_tx, job_rx) = mpsc::channel::<DirJob>(
-            2 * MAX_CONCURRENT_DOWNLOADS,
-        );
-        let job_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
-
-        // Spawn the downloader pool. Each task owns one
-        // `Arc<RawSftpSession>` and pulls jobs from the shared
-        // mpsc receiver. The walker task (us) does not block on
-        // `recv()` — it's busy walking and pushing.
-        let mut downloader_handles = Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
-        for (slot_id, raw) in downloader_raws.into_iter().enumerate() {
-            let job_rx = Arc::clone(&job_rx);
-            let db = db.clone();
-            let handle = tokio::spawn(async move {
-                downloader_loop(slot_id, raw, job_rx, db, max_retries).await
-            });
-            downloader_handles.push(handle);
-        }
-
-        // The walker pass. We use the dedicated `walker_raw`
-        // for readdirs. The `xargs sha256sum` exec uses a
-        // fresh session channel per directory, opened on the
-        // shared `Handle` (it's a session-level operation, not
-        // SFTP).
+        // The walker pass. We use the dedicated `walker_channel`
+        // for readdirs. The `xargs sha256sum` exec uses a fresh
+        // session channel per directory, opened on the shared
+        // `Handle` (it's a session-level operation, not SFTP).
 
         // List top-level remote directories in this category.
-        let remote_dirs = list_remote_dirs(&walker_raw, &remote_base).await
+        let remote_dirs = list_remote_dirs(&walker_channel, &remote_base).await
             .with_context(|| format!("failed to list remote dirs in {}", remote_base.display()))?;
         info!(category = %category, count = remote_dirs.len(), "walker: remote directories found");
 
@@ -1484,7 +1663,7 @@ mod self_clone {
             // download-time integrity verification). Walking
             // twice would double the per-dir cost for no benefit.
             let walk_started = Instant::now();
-            let manifest = match collect_manifest(&walker_raw, &remote_dir).await {
+            let manifest = match collect_manifest(&walker_channel, &remote_dir).await {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(dir = %dir_name, error = %e, "walker: failed to collect manifest, skipping");
@@ -1523,34 +1702,14 @@ mod self_clone {
             // decision is correct. The natural order is:
             //
             //   1. collect_manifest (no DB)
-            //   2. collect_remote_hashes with skip=empty (no DB
-            //      needed, but on re-walk we want the existing
-            //      rows)
-            //
-            // That requires running a *first* upsert to get a
-            // `dir_id`, then querying existing-hashes, then
-            // collecting. Two passes? No — the right shape is:
-            //
-            //   1. collect_manifest
             //   2. upsert_directory → (dir_id, prev_state)
             //   3. existing_hashes = get_existing_hashes_for_dir(dir_id)
             //   4. NEW file_hashes = collect_remote_hashes(
             //         manifest, skip=existing_hashes)
             //   5. db.append_file_hashes(dir_id, &NEW)
             //
-            // That's what we do. Step 2 and 3 are one round-trip
-            // each; the alternative (collect-hashes-first, then
-            // upsert) would re-hash on every re-walk even for
-            // dirs with stable manifests.
-            //
-            // The manifest hash is the change detector: if
-            // anything on the remote changed, the manifest hash
-            // changes, the row is upserted, and step 3 returns
-            // the OLD set of hashes (for the previous manifest).
-            // Those are stale — we re-collect from scratch.
-            // `collect_remote_hashes`'s skip-set logic is the
-            // optimization for the "manifest unchanged, just
-            // checking nothing moved" case.
+            // That's what we do. Steps 2 and 3 are one
+            // round-trip each.
             let manifest_hash = manifest_hash_from_files(&manifest);
             let upsert_started = Instant::now();
             let (dir_id, _prev_state) = db.upsert_directory(
@@ -1567,7 +1726,7 @@ mod self_clone {
             let existing_hashes = db.get_existing_hashes_for_dir(dir_id)
                 .context("walker: failed to query existing hashes")?;
             let hash_started = Instant::now();
-            let file_hashes = collect_remote_hashes(&session, &remote_dir, &manifest, &existing_hashes).await
+            let file_hashes = collect_remote_hashes(&handle, &remote_dir, &manifest, &existing_hashes).await
                 .unwrap_or_else(|e| {
                     warn!(dir = %dir_name, error = %e, "walker: failed to collect remote hashes; verification will be skipped for this dir");
                     Vec::new()
@@ -1584,81 +1743,22 @@ mod self_clone {
                     .context("walker: failed to append file hashes")?;
             }
 
-            // Push the job to the downloader pool. The downloader
-            // side checks the directory's *current* state (which
-            // `upsert_directory` may have just transitioned to
-            // `Detected` from a previous `Synced`/`Syncing`/
-            // `SyncingFailed`) and only actually downloads if it's
-            // `Detected`. This is the "only re-download what
-            // changed" invariant: a directory with an unchanged
-            // manifest stays in `Synced`, and the downloader
-            // pool's `state == Detected` check skips it.
-            let job = DirJob {
+            // The row is now in the DB (state = 'detected' if
+            // the manifest changed or it was a fresh dir;
+            // otherwise the manifest is unchanged and the row
+            // stays in 'synced'). Either way, the walker's job
+            // for this directory is done — the long-lived
+            // downloader pool will claim the row if it's
+            // 'detected'. There is no job dispatch from the
+            // walker.
+            info!(
+                dir = %dir_name,
                 dir_id,
-                category: category.clone(),
-                remote_path: remote_dir_str,
-                staging_path: staging_dir_str,
-            };
-
-            // Backpressure: if the pool is fully busy, the
-            // mpsc::Sender::send().await will suspend the walker
-            // until a slot frees. This is the natural rate-limiter:
-            // a walker that's faster than the downloaders will
-            // block on `send()` rather than overflow the queue.
-            if let Err(e) = job_tx.send(job).await {
-                // The receiver side is closed — this only happens
-                // if a downloader task bailed. The whole pipeline
-                // is going down; surface the error to the caller.
-                anyhow::bail!("walker: downloader pool closed early: {}", e);
-            }
+                "walker: directory walk finished"
+            );
         }
 
         info!(category = %category, "walker: complete");
-        // **Drop the producer's `Sender` explicitly** so the
-        // mpsc closes — and the downloaders see `None` from
-        // `recv()` — *before* we await their `JoinHandle`s.
-        // Without the explicit `drop`, `job_tx` survives
-        // until the end of `run_walker`'s scope (after the
-        // downloader-await loop), the channel stays open, and
-        // every downloader hangs in `recv().await` forever
-        // even though the walker has no more work to push.
-        // This was the source of the "walker hangs after
-        // completing a category" bug observed on 2026-06-14:
-        // an empty category logged "walker: complete", the
-        // downloader pool was spawned-and-idle, the walker
-        // blocked forever in the `for h in downloader_handles`
-        // loop below because `job_tx` was still alive.
-        drop(job_tx);
-
-        // Wait for the downloader pool to drain. We do this
-        // *after* the walker has finished pushing and the
-        // producer `Sender` has dropped (so no more jobs are
-        // coming and the channel is closed), but the pool may
-        // still be in the middle of a multi-GB transfer. We
-        // don't time out — large files are the point of the
-        // parallelism.
-        let mut download_errors: Vec<anyhow::Error> = Vec::new();
-        for (i, h) in downloader_handles.into_iter().enumerate() {
-            match h.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => download_errors.push(e),
-                Err(join) => download_errors.push(
-                    anyhow::anyhow!("downloader slot {} panicked: {}", i, join)
-                ),
-            }
-        }
-
-        // Disconnect cleanly. The walker is the only thing with
-        // a Handle now, so this is the right place.
-        let _ = session.disconnect(Disconnect::ByApplication, "sync complete", "");
-
-        if !download_errors.is_empty() {
-            for e in &download_errors {
-                error!(category = %category, error = %e, "walker: downloader reported error");
-            }
-            return Err(download_errors.into_iter().next().unwrap());
-        }
-
         Ok(())
     }
 
@@ -1733,7 +1833,7 @@ mod self_clone {
     }
 
     pub async fn collect_remote_hashes(
-        session: &client::Handle<ClientHandler>,
+        handle: &Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>,
         remote_dir: &Path,
         manifest: &BTreeMap<String, (u64, u64)>,
         skip: &std::collections::HashSet<String>,
@@ -1797,12 +1897,22 @@ mod self_clone {
             "walker: remote hashing starting"
         );
 
-        // Open a new session channel via the cloned russh handle.
-        // This is independent of the SFTP subsystem channel used
-        // for the readdir walks — `exec` runs in its own channel
-        // per the SSH spec.
-        let mut channel = session.channel_open_session().await
-            .context("failed to open SSH channel for sha256sum exec")?;
+        // Open a new session channel via the shared russh
+        // Handle (wrapped in a Mutex so the walker and the
+        // engine's Drop impl can share it). The lock is held
+        // only for the duration of `channel_open_session` —
+        // once the channel is open, the rest of the function
+        // works on the channel directly and the Handle is
+        // free for other consumers.
+        //
+        // This is independent of the SFTP subsystem channel
+        // used for the readdir walks — `exec` runs in its own
+        // channel per the SSH spec.
+        let mut channel = {
+            let h = handle.lock().await;
+            h.channel_open_session().await
+                .context("failed to open SSH channel for sha256sum exec")?
+        };
 
         // `xargs -d '\n' sha256sum` — split stdin on newlines,
         // invoke sha256sum once per path. The command itself is
@@ -1874,100 +1984,125 @@ mod self_clone {
 /// the receiver gets a job and releases the lock, the next
 /// waiter acquires it. This is the standard pattern for
 /// "N workers, 1 queue" in tokio.
+/// Downloader loop, DB-driven. Each downloader task runs this
+/// loop concurrently with the others. The dispatch primitive is
+/// `db.claim_detected_row` — an atomic `UPDATE ... WHERE state =
+/// 'detected'` that returns the row only if no other downloader
+/// has already claimed it. There is no in-process mpsc; the DB is
+/// the work queue.
+///
+/// **Drain semantics.** When the orchestrator calls
+/// `pool.signal_drain()`, each downloader observes the signal in
+/// its main loop. The exit condition is `drain_signal && count
+/// (detected) == 0` — i.e. "no more walkers are coming AND the
+/// queue is empty." This lets the pool process rows the very
+/// last walker produced before exiting, instead of aborting them.
+///
+/// **Halt semantics.** A single file that exhausts its retry
+/// budget returns `Err` from `download_directory`. The downloader
+/// marks the row `sync_failed` (so a re-run knows to retry it
+/// from the new run's startup sweep), then returns `Err` from
+/// the loop. The aggregator task in `DownloaderPool::spawn`
+/// collects errors and propagates the first one, which surfaces
+/// to the caller of `drain_pool`. This is the same halt-on-
+/// exhaust behavior as the previous (mpsc-based) design.
 async fn downloader_loop(
     slot_id: usize,
     raw: Arc<RawSftpSession>,
-    job_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirJob>>>,
     db: Database,
+    mut drain_signal: watch::Receiver<bool>,
     max_retries: u32,
+    poll_interval: Duration,
 ) -> anyhow::Result<()> {
     info!(slot = slot_id, "downloader: starting");
 
     loop {
-        let job = {
-            let mut rx = job_rx.lock().await;
-            rx.recv().await
-        };
-        let Some(job) = job else {
-            // Channel closed — the walker is done. No more jobs
-            // coming. Exit cleanly.
-            info!(slot = slot_id, "downloader: no more jobs, exiting");
-            return Ok(());
+        // Check drain condition first. We exit only when the
+        // orchestrator has signaled AND the DB has no more
+        // detected rows. Checking `count_detected` only when
+        // the signal is set is the cheap case; the expensive
+        // case (the count is non-zero) is rare and bounded by
+        // how fast the walker is producing rows.
+        if *drain_signal.borrow() {
+            let pending = db.count_detected().unwrap_or_else(|e| {
+                // If the count itself fails, assume pending =
+                // 1 so we keep polling. A DB error here is
+                // very unusual; logging + assuming pending is
+                // safer than exiting on what might be a
+                // transient error.
+                warn!(slot = slot_id, error = %e, "downloader: count_detected failed; assuming pending=1");
+                1
+            });
+            if pending == 0 {
+                info!(slot = slot_id, "downloader: pool drained, exiting");
+                return Ok(());
+            }
+            // Drain signaled but work is still pending — fall
+            // through to claim.
+        }
+
+        // Try to claim a row. If no row is detected, wait
+        // for either a drain-signal change or a poll
+        // interval, whichever comes first. The select keeps
+        // the exit latency low (we don't have to wait out
+        // the full poll interval after a drain signal).
+        let claim = match db.claim_detected_row() {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                tokio::select! {
+                    _ = drain_signal.changed() => continue,
+                    _ = tokio::time::sleep(poll_interval) => continue,
+                }
+            }
+            Err(e) => {
+                warn!(slot = slot_id, error = %e, "downloader: claim failed; backing off");
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
         };
 
         info!(
             slot = slot_id,
-            dir_id = job.dir_id,
-            remote = %job.remote_path,
+            dir_id = claim.id,
+            remote = %claim.remote_path,
             "downloader: starting directory"
         );
 
-        // Check the directory's *current* state. The walker
-        // may have upserted it to `Detected` (from `Synced` if
-        // the manifest changed, from `SyncingFailed` if a
-        // prior run failed) or left it as `Synced` (if the
-        // manifest is unchanged). We only download on
-        // `Detected`.
-        let current = db.get_directory_by_id(job.dir_id)
-            .with_context(|| format!("downloader: failed to load dir_id={}", job.dir_id))?;
-        let Some(current) = current else {
-            warn!(slot = slot_id, dir_id = job.dir_id, "downloader: dir row vanished; skipping");
-            continue;
-        };
-        if current.state != DirectoryState::Detected {
-            info!(
-                slot = slot_id,
-                dir_id = job.dir_id,
-                state = %current.state.as_str(),
-                "downloader: skipping (not in Detected state)"
-            );
-            continue;
-        }
-
-        // Mark the directory as `Syncing` *before* we start the
-        // transfer. If the downloader crashes, the next run
-        // sees `Syncing` (or `SyncingFailed` if we set the
-        // error) and can decide whether to retry.
-        db.set_directory_state(job.dir_id, DirectoryState::Syncing)?;
-
-        // Call the free-function `download_directory` directly.
-        // The shim-on-`SyncEngine` pattern was awkward; with the
-        // download path pulled out of `&self`, the pool tasks
-        // call the implementation without an intermediate.
+        // The row is in `Syncing` (claim transitioned it). The
+        // download itself uses the same free function
+        // `download_directory` as before; the only difference
+        // is the source of the row data (DB claim vs mpsc
+        // job).
         let result = download_directory(
             &raw,
-            job.remote_path.clone(),
-            job.staging_path.clone(),
+            claim.remote_path.clone(),
+            claim.staging_path.clone(),
             String::new(),
             &db,
-            job.dir_id,
+            claim.id,
             max_retries,
         ).await;
 
         match result {
             Ok(()) => {
-                db.set_directory_state(job.dir_id, DirectoryState::Synced)?;
-                info!(slot = slot_id, dir_id = job.dir_id, "downloader: complete");
+                db.set_directory_state(claim.id, DirectoryState::Synced)?;
+                info!(slot = slot_id, dir_id = claim.id, "downloader: complete");
             }
             Err(e) => {
                 let msg = format!("download failed: {}", e);
                 let _ = db.set_directory_error(
-                    job.dir_id, DirectoryState::SyncingFailed, &msg,
+                    claim.id, DirectoryState::SyncingFailed, &msg,
                 );
-                error!(slot = slot_id, dir_id = job.dir_id, error = %e, "downloader: failed");
-
-                // Halt semantics: a single file that exhausts
-                // its retry budget bubbles up as an `Err` from
-                // `download_directory`. Returning that error
-                // here closes this downloader task, but the
-                // other downloaders are still running. The
-                // orchestrator (in `sync_category`) collects
-                // all downloader errors and `bail!`s on the
-                // first. This is intentional: one bad file
-                // halts the pipeline so the operator gets
-                // paged, but the other in-flight transfers
-                // finish gracefully (the channel close
-                // propagates when *all* downloaders return).
+                error!(slot = slot_id, dir_id = claim.id, error = %e, "downloader: failed");
+                // Halt: returning Err from this loop closes
+                // this slot. The aggregator in
+                // `DownloaderPool::spawn` collects errors from
+                // all slots and propagates the first one to the
+                // caller of `drain_pool`. The row is left in
+                // `sync_failed` (set above); the next run's
+                // startup will reset it to `detected` via
+                // `upsert_directory`'s `*Failed → detected`
+                // transition.
                 return Err(e);
             }
         }
@@ -3013,168 +3148,150 @@ mod tests {
     }
 
     // =====================================================================
-    // Walker → downloader pool shutdown handshake
+    // DB-driven dispatch: claim, sweep, drain
     // =====================================================================
     //
-    // The walker pushes `DirJob`s to the downloader pool over a
-    // bounded mpsc. The pool's `JoinHandle`s must terminate when
-    // the walker is done — both for the empty-category case
-    // (walker walked 0 dirs, never sent a job) and for the
-    // non-empty case (walker drained the queue, sent the last
-    // job, now waits for the pool to finish processing).
-    //
-    // The handshake is subtle: the mpsc only closes when *all*
-    // `Sender`s are dropped. If the walker holds its `Sender`
-    // past the `await` on the pool's `JoinHandle`s, the channel
-    // stays open and the pool's `recv().await` blocks forever —
-    // even on an empty walk. This was the source of the
-    // "walker hangs after completing a category" bug observed
-    // on 2026-06-14: the empty `books/` category logged
-    // "walker: complete" and the process was wedged for 7+
-    // minutes before being killed.
-    //
-    // These tests pin the handshake down. The shape of the
-    // walker code that broke was:
-    //
-    //   ```
-    //   info!("walker: complete");
-    //   // job_tx drops at end of scope, AFTER the for-loop below
-    //   for h in downloader_handles {
-    //       h.await;  // <- hangs if pool is parked in recv()
-    //   }
-    //   ```
-    //
-    // We don't have a unit-testable handle to `run_walker` (it
-    // requires a real `client::Handle<ClientHandler>` and a real
-    // SFTP server), so we test the *pattern* directly: spawn
-    // `MAX_CONCURRENT_DOWNLOADS` downloader tasks sharing an
-    // `Arc<Mutex<Receiver<DirJob>>>`, drop the producer's
-    // `Sender`, and assert the joins complete within a tight
-    // bound. If the contract is "drop the Sender before
-    // awaiting the workers", a regression that holds the Sender
-    // past the await will hang this test (and fail the suite
-    // via the outer `tokio::time::timeout`).
+    // The pre-2026-06-14 design used a `mpsc::Sender<DirJob>` to
+    // dispatch work from the walker to the downloader pool, and
+    // the test suite pinned the "drop the Sender before
+    // awaiting the pool" handshake that kept the empty-walk
+    // case from hanging. After the DB-driven dispatch refactor,
+    // there is no mpsc — the dispatch is `db.claim_detected_row`,
+    // an atomic UPDATE that returns the row only if no other
+    // downloader has already claimed it. These tests pin the
+    // new contract: the claim is atomic, the stale-Syncing
+    // sweep recovers orphan rows, and the pool drains when
+    // signaled even with rows still in the DB.
 
-    /// The happy path: producer drops its `Sender`, all
-    /// `MAX_CONCURRENT_DOWNLOADS` downloader tasks see `None`
-    /// from `recv()` and exit. The outer `tokio::time::timeout`
-    /// (1 s) is the canary: a regression that holds the
-    /// `Sender` past the await hangs the pool, the timeout
-    /// fires, the test fails loudly.
-    #[tokio::test]
-    async fn test_walker_pool_shutdown_when_producer_drops_sender() {
-        let (job_tx, job_rx) = mpsc::channel::<DirJob>(2 * MAX_CONCURRENT_DOWNLOADS);
-        let job_rx = std::sync::Arc::new(tokio::sync::Mutex::new(job_rx));
+    use crate::db::DirectoryState;
 
-        // Spawn the downloader pool. Each task pulls jobs
-        // from the shared mpsc receiver until the channel
-        // closes. The body is the same recv-and-shutdown
-        // shape as `downloader_loop` (we can't call
-        // `downloader_loop` directly here because it touches
-        // the DB, which we don't need for this test).
-        let mut handles = Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
-        for slot in 0..MAX_CONCURRENT_DOWNLOADS {
-            let job_rx = std::sync::Arc::clone(&job_rx);
-            let handle: tokio::task::JoinHandle<usize> = tokio::spawn(async move {
-                loop {
-                    let job = {
-                        let mut rx = job_rx.lock().await;
-                        rx.recv().await
-                    };
-                    if job.is_none() {
-                        return slot;
-                    }
-                    // A real job would be processed here. We
-                    // don't care — this test is about the
-                    // shutdown handshake, not the work.
-                }
-            });
-            handles.push(handle);
-        }
-
-        // The contract: the producer drops its `Sender` *before*
-        // awaiting the pool's `JoinHandle`s. Anything else
-        // hangs the pool in `recv()`.
-        drop(job_tx);
-
-        // Assert the pool drains within a tight bound. A
-        // regression (Sender held past this point) makes the
-        // pool hang in `recv().await` forever; the timeout
-        // fires and the test fails.
-        let mut seen_slots: Vec<usize> = Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
-        for h in handles {
-            let slot = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                h,
-            )
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "downloader slot failed to shut down within 1s; \
-                     the producer's Sender is likely held past the await"
-                )
-            })
-            .expect("downloader task panicked");
-            seen_slots.push(slot);
-        }
-        seen_slots.sort();
-        assert_eq!(
-            seen_slots,
-            (0..MAX_CONCURRENT_DOWNLOADS).collect::<Vec<_>>(),
-            "all downloader slots must have run"
-        );
+    /// Insert a `Detected` row directly via the DB. The
+    /// production walker does the same thing via
+    /// `db.upsert_directory`; this helper skips that path
+    /// because the dispatch contract doesn't depend on how
+    /// the row got there.
+    fn insert_detected(db: &Database, category: &str, name: &str) -> i64 {
+        let staging = tempfile::tempdir().unwrap();
+        let staging_path = staging.path().to_string_lossy().to_string();
+        let remote_path = format!("/remote/{}/{}", category, name);
+        let (id, _prev) = db.upsert_directory(
+            category,
+            &remote_path,
+            &staging_path,
+            "test-manifest-hash",
+        ).unwrap();
+        id
     }
 
-    /// The empty-walk case: producer sends zero jobs and then
-    /// drops the `Sender`. This is the exact shape of the
-    /// 2026-06-14 bug — `books/` had 0 remote dirs, the walker
-    /// never sent a job, and the downloaders hung in
-    /// `recv().await` because the `Sender` was held past the
-    /// await. The previous test covers the contract; this one
-    /// pins the *empty* variant explicitly, with a comment
-    /// naming the production incident.
+    /// **Atomic claim.** Two concurrent claimers, one row,
+    /// exactly one wins. This is the property that lets the
+    /// downloader pool scale to N parallel downloaders
+    /// without coordination beyond the DB.
     #[tokio::test]
-    async fn test_walker_pool_shutdown_with_zero_jobs() {
-        let (job_tx, job_rx) = mpsc::channel::<DirJob>(2 * MAX_CONCURRENT_DOWNLOADS);
-        let job_rx = std::sync::Arc::new(tokio::sync::Mutex::new(job_rx));
+    async fn test_claim_detected_row_atomic_under_concurrent_callers() {
+        let db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        insert_detected(&db, "movies", "A");
 
-        let mut handles = Vec::with_capacity(MAX_CONCURRENT_DOWNLOADS);
-        for _ in 0..MAX_CONCURRENT_DOWNLOADS {
-            let job_rx = std::sync::Arc::clone(&job_rx);
-            let handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
-                loop {
-                    let job = {
-                        let mut rx = job_rx.lock().await;
-                        rx.recv().await
-                    };
-                    if job.is_none() {
-                        return;
-                    }
-                }
-            });
-            handles.push(handle);
-        }
+        // Two claimers race. The DB serializes writes through
+        // the connection mutex, so exactly one UPDATE will
+        // affect the row (return `Some`), and the other will
+        // see the row already in `Syncing` and return `None`.
+        let db1 = db.clone();
+        let db2 = db.clone();
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move { db1.claim_detected_row() }),
+            tokio::spawn(async move { db2.claim_detected_row() }),
+        );
+        let r1 = r1.unwrap().unwrap();
+        let r2 = r2.unwrap().unwrap();
 
-        // Zero jobs sent. Drop the Sender. The pool must
-        // exit promptly. This is the precise shape that hung
-        // the walker on 2026-06-14.
-        drop(job_tx);
+        let winners = [r1.is_some(), r2.is_some()].iter().filter(|x| **x).count();
+        let losers = [r1.is_none(), r2.is_none()].iter().filter(|x| **x).count();
+        assert_eq!(winners, 1, "exactly one claimer must win the row");
+        assert_eq!(losers, 1, "exactly one claimer must see the row already claimed");
 
-        for h in handles {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                h,
-            )
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "downloader failed to shut down on an empty walk within 1s; \
-                     the producer's Sender is likely held past the await \
-                     (see 2026-06-14 walker-hang incident)"
-                )
-            })
-            .expect("downloader task panicked");
-        }
+        // The row is now in `Syncing`, not `Detected`.
+        let current = db.get_directory_by_id(r1.unwrap_or_else(|| r2.unwrap()).id)
+            .unwrap().unwrap();
+        assert_eq!(current.state, DirectoryState::Syncing,
+            "claimed row must be in Syncing, not Detected");
+    }
+
+    /// **Claim returns oldest first.** Two rows in `Detected`,
+    /// claim should return the older one (lowest `detected_at`).
+    /// This is the FIFO invariant — if a downloader always
+    /// grabbed the newest row, an old row could starve.
+    #[tokio::test]
+    async fn test_claim_detected_row_returns_oldest_first() {
+        let db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        // Insert "A" first, then "B". A's `detected_at` is
+        // older (or equal — both are CURRENT_TIMESTAMP at
+        // insert time, so the ORDER BY may be tie-broken by
+        // id, which is monotonically increasing, so the
+        // older row's id is smaller). To make A
+        // deterministically older, sleep briefly between
+        // inserts.
+        let id_a = insert_detected(&db, "movies", "A");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let _id_b = insert_detected(&db, "movies", "B");
+
+        let claim = db.claim_detected_row().unwrap().unwrap();
+        assert_eq!(claim.id, id_a, "claim must return the oldest Detected row first");
+    }
+
+    /// **Stale-Syncing sweep.** A row in `Syncing` for 7 hours
+    /// (longer than the 6h threshold) gets reset to `Detected`
+    /// by the sweep. A row in `Syncing` for 1 hour (under the
+    /// threshold) is left alone.
+    #[tokio::test]
+    async fn test_stale_syncing_sweep_recovers_orphan_rows() {
+        let db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        let id_stale = insert_detected(&db, "movies", "Stale");
+        let id_fresh = insert_detected(&db, "movies", "Fresh");
+
+        // Claim both to put them in `Syncing`.
+        let claim_stale = db.claim_detected_row().unwrap().unwrap();
+        let claim_fresh = db.claim_detected_row().unwrap().unwrap();
+        assert_eq!(claim_stale.id, id_stale);
+        assert_eq!(claim_fresh.id, id_fresh);
+
+        // Push `syncing_at` for `id_stale` back to 7 hours
+        // ago. `id_fresh`'s `syncing_at` is `now` (set by the
+        // claim) — well within the 6h window.
+        db._test_set_syncing_at(id_stale, "-7 hours").unwrap();
+
+        let recovered = db.stale_syncing_sweep(6).unwrap();
+        assert_eq!(recovered, 1, "sweep should recover exactly the stale row");
+
+        // The stale row is back in `Detected`. The fresh row
+        // is still in `Syncing`.
+        let stale_row = db.get_directory_by_id(id_stale).unwrap().unwrap();
+        let fresh_row = db.get_directory_by_id(id_fresh).unwrap().unwrap();
+        assert_eq!(stale_row.state, DirectoryState::Detected,
+            "stale-Syncing row should be reset to Detected");
+        assert_eq!(fresh_row.state, DirectoryState::Syncing,
+            "fresh-Syncing row should be left alone");
+    }
+
+    /// **count_detected.** Rows in `Detected` count; rows in
+    /// other states don't. Used by the downloader pool's
+    /// drain check.
+    #[tokio::test]
+    async fn test_count_detected_counts_only_detected_rows() {
+        let db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        // Three rows in `Detected` (fresh inserts).
+        insert_detected(&db, "movies", "A");
+        insert_detected(&db, "movies", "B");
+        insert_detected(&db, "movies", "C");
+        // One row forced to `Synced`.
+        let id_synced = insert_detected(&db, "movies", "D");
+        db.set_directory_state(id_synced, DirectoryState::Synced).unwrap();
+        // One row claimed → `Syncing`.
+        let _id_claimed = insert_detected(&db, "movies", "E");
+        let _ = db.claim_detected_row().unwrap().unwrap();
+
+        let n = db.count_detected().unwrap();
+        assert_eq!(n, 3, "count_detected should see only rows in Detected state (got {})", n);
     }
 
     // =====================================================================

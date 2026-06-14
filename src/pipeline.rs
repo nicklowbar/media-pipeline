@@ -51,29 +51,36 @@ pub fn build_metadata_lookup(config: &Config, db: &Database) -> Arc<dyn Metadata
 pub async fn run_sync(config: &Config, db: &Database) -> anyhow::Result<()> {
     info!("starting sync phase");
 
+    // One SyncEngine per pipeline run. The engine owns the
+    // SSH Handle for the whole run, opens a long-lived
+    // downloader pool at startup, and runs categories
+    // sequentially. The pool is drained at the end of the run
+    // (no matter which category is current) so the run doesn't
+    // leak tasks.
+    let mut sync_engine = match sync::SyncEngine::new(config, db).await {
+        Ok(engine) => engine,
+        Err(e) => {
+            error!(error = %e, "failed to initialize SyncEngine; aborting sync phase");
+            return Err(e);
+        }
+    };
+
     for (category_name, _) in &config.categories {
         info!(category = %category_name, "syncing category");
-        // Fresh SyncEngine per category: the walker takes
-        // the session Handle when it spawns and disconnects
-        // when it finishes, so the next category needs its
-        // own SSH connection. ~200ms handshake per category
-        // is fine — the actual sync work is hours for a
-        // full library, and the bookkeeping keeps each
-        // category's walker + downloader pool fully
-        // isolated.
-        let mut sync_engine = match sync::SyncEngine::new(config).await {
-            Ok(engine) => engine,
-            Err(e) => {
-                error!(category = %category_name, error = %e,
-                    "failed to initialize sync engine; skipping category");
-                continue;
-            }
-        };
         if let Err(e) = sync_engine.sync_category(category_name, db).await {
             error!(category = %category_name, error = %e, "category sync failed");
-            // Continue with other categories rather than failing the whole pipeline
+            // Continue with other categories rather than failing
+            // the whole pipeline; the DB is the source of truth
+            // and a per-category failure doesn't poison the rest.
         }
     }
+
+    // Drain the pool. This signals the downloaders to exit
+    // when the DB has no more `Detected` rows, and awaits
+    // their `JoinHandle`s. If any downloader returned an
+    // error (e.g. a file exhausted its retry budget), the
+    // error surfaces here.
+    sync_engine.drain_pool().await?;
 
     info!("sync phase complete");
     Ok(())
