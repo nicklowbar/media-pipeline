@@ -161,13 +161,17 @@ enum LocalFileDisposition {
 /// of `download_file` will catch any regression there.)
 ///
 /// **Hashing logic.** When `expected_hash` is `Some`, we recompute
-/// the local SHA-256 and compare. A mismatch is a hard error —
-/// `Err` propagates up to the caller, which marks the directory as
-/// `sync_failed` and surfaces the failure to the operator. We do
-/// **not** auto-redownload on mismatch: a persistent mismatch
-/// usually means the recorded hash itself is corrupt (DB drift,
-/// wrong manifest) and the operator needs to investigate, not have
-/// the loop spin.
+/// the local SHA-256 and compare. A mismatch returns
+/// `LocalFileDisposition::Download` so the corrupt local copy is
+/// discarded and the file is re-pulled from SFTP. The mismatch is
+/// also logged at `warn` level so a persistent mismatch — which
+/// usually means the *recorded* hash is wrong (DB drift, wrong
+/// manifest) — is still visible to the operator. Returning `Err`
+/// instead would propagate up to the downloader pool, halt the
+/// per-directory walk, and crash the process; the post-download
+/// check inside `try_download_file` is the right place to surface
+/// a *truly* persistent mismatch (retry budget exhausted) as a
+/// hard failure.
 ///
 /// **No-hash case.** When `expected_hash` is `None` (the manifest
 /// was collected but `collect_remote_hashes` failed for this
@@ -215,14 +219,22 @@ async fn verify_existing_file(
     if actual == expected {
         Ok(LocalFileDisposition::Trust)
     } else {
-        // Loud, structured error. The caller (download_file)
-        // wraps this with file context for the operator.
-        Err(anyhow::anyhow!(
-            "sha256 mismatch on existing local file {}: expected {}, got {}",
-            local.display(),
-            expected,
-            actual
-        ))
+        // Loud warning + structured log so a persistent
+        // mismatch (DB drift, wrong manifest) is still visible
+        // to the operator, but treat the disposition as
+        // `Download` so the corrupt local copy is replaced
+        // rather than halting the entire walker. The
+        // post-download check in `try_download_file` will
+        // catch a *truly* persistent mismatch after the retry
+        // budget is exhausted.
+        warn!(
+            file = %local.display(),
+            expected = %expected,
+            actual = %actual,
+            "sha256 mismatch on existing local file: expected {}, got {}; will re-download",
+            expected, actual
+        );
+        Ok(LocalFileDisposition::Download)
     }
 }
 
@@ -497,43 +509,50 @@ impl client::Handler for ClientHandler {
     }
 }
 
+/// Establish a fresh russh session: TCP+SSH transport,
+/// public-key auth, returns the authenticated `Handle`.
+/// Used by `SyncEngine::new` (initial connect) and by
+/// `reconnect_handle_and_sftp` (Handle-level recovery when
+/// a single-channel re-open fails — the underlying SSH
+/// transport itself is sick, not just one channel).
+///
+/// **Idempotent w.r.t. callers.** Each call dials a fresh
+/// `client::connect`; the caller is responsible for
+/// discarding any prior `Handle` it held (typically by
+/// swapping the value inside a Mutex). The function does
+/// NOT close or signal the old session — russh's `Handle`
+/// doesn't expose a public `disconnect` and best-effort
+/// teardown is the caller's concern.
+async fn establish_russh_session(
+    config: &Config,
+) -> anyhow::Result<client::Handle<ClientHandler>> {
+    let ssh_config = std::sync::Arc::new(client::Config::default());
+    let port = config.ssh.port.unwrap_or(22);
+    info!(host = %config.ssh.host, port, user = %config.ssh.user, "connecting to ssh");
+    let mut session = client::connect(ssh_config, (config.ssh.host.as_str(), port), ClientHandler)
+        .await
+        .with_context(|| format!("failed to connect to {}:{}", config.ssh.host, port))?;
+    let key_pair = russh::keys::load_secret_key(&config.ssh.private_key_path, None)
+        .with_context(|| {
+            format!("failed to load private key from {}", config.ssh.private_key_path.display())
+        })?;
+    let auth_result = session
+        .authenticate_publickey(&config.ssh.user, std::sync::Arc::new(key_pair))
+        .await
+        .context("public key authentication failed")?;
+    if !auth_result {
+        anyhow::bail!("SSH public key authentication failed");
+    }
+    info!("ssh authenticated successfully");
+    Ok(session)
+}
+
 impl SyncEngine {
     /// Connect to the remote, open the walker + N downloader SFTP
     /// channels, and spawn the downloader pool. The returned
     /// `SyncEngine` is ready to call `sync_category(...)` on.
     pub async fn new(config: &Config, db: &Database) -> anyhow::Result<Self> {
-        let ssh_config = client::Config::default();
-        let ssh_config = std::sync::Arc::new(ssh_config);
-
-        let handler = ClientHandler;
-
-        let port = config.ssh.port.unwrap_or(22);
-        info!(host = %config.ssh.host, port, user = %config.ssh.user, "connecting to ssh");
-
-        let mut session = client::connect(ssh_config, (config.ssh.host.as_str(), port), handler)
-            .await
-            .with_context(|| format!("failed to connect to {}:{}", config.ssh.host, port))?;
-
-        let key_pair = russh::keys::load_secret_key(&config.ssh.private_key_path,
-            None,
-        )
-        .with_context(|| {
-            format!(
-                "failed to load private key from {}",
-                config.ssh.private_key_path.display()
-            )
-        })?;
-
-        let auth_result = session
-            .authenticate_publickey(&config.ssh.user,
-                std::sync::Arc::new(key_pair),
-            )
-            .await
-            .context("public key authentication failed")?;
-
-        if !auth_result {
-            anyhow::bail!("SSH public key authentication failed");
-        }
+        let session = establish_russh_session(config).await?;
 
         info!("ssh authenticated successfully");
 
@@ -584,9 +603,14 @@ impl SyncEngine {
         // walker_channel / SyncEngine::open_sftp_session
         // path); we pass it here so downloader tasks can
         // re-open the SFTP channel between retry attempts.
+        // The `config` Arc is passed so downloader tasks can
+        // escalate to a Handle-level reconnect (fresh russh
+        // session) when a single-channel re-open fails — the
+        // 2026-06-16 physalis production failure mode.
         let max_retries = config.max_download_retries();
         let poll_interval = Duration::from_millis(200);
-        let pool = DownloaderPool::new(downloader_channels, Arc::clone(&handle), max_retries, poll_interval);
+        let config = Arc::new(config.clone());
+        let pool = DownloaderPool::new(downloader_channels, Arc::clone(&handle), max_retries, poll_interval, config);
         let pool_join = Some(pool.spawn(db.clone()));
 
         Ok(SyncEngine {
@@ -666,6 +690,66 @@ impl SyncEngine {
             .context("SFTP init/version handshake failed")?;
         Ok(raw)
     }
+
+    /// Handle-level reconnect: replace the russh `Handle`
+    /// inside the shared `Arc<Mutex<Handle>>` with a fresh
+    /// one (new TCP+SSH transport + public-key auth), then
+    /// open a fresh SFTP subsystem on the new Handle.
+    /// Returns the new `Arc<RawSftpSession>` so the caller
+    /// can swap its per-task `current_raw` over.
+    ///
+    /// **When to use.** This is the escalation step inside
+    /// `download_file`'s retry loop when the cheaper
+    /// per-attempt channel re-open (above) fails. The
+    /// channel re-open fails when the *underlying SSH
+    /// transport* is sick (visible as `failed to open SSH
+    /// channel for SFTP` from `channel_open_session`); a
+    /// fresh transport is the only recovery that addresses
+    /// that case. The 2026-06-16 physalis production log
+    /// shows the failure mode: the channel re-open fails,
+    /// we fall through with the same dead channel, the next
+    /// retry fails identically, the budget is exhausted.
+    ///
+    /// **Concurrency.** The Mutex serializes the swap with
+    /// any other consumer of the Handle (e.g. the walker
+    /// task). Anyone taking the lock after this call sees
+    /// the new Handle. Anyone *currently* holding the old
+    /// Handle keeps using it until they drop it; the old
+    /// Handle is replaced (not cloned), so the prior user's
+    /// channel is closed from the engine's perspective even
+    /// though their local copy is still live. This is the
+    /// same behavior as `tokio::sync::Mutex` swap
+    /// everywhere — it's the right shape.
+    ///
+    /// **Scope limit.** The walker task uses the engine's
+    /// pre-opened `walker_channel` and does not currently
+    /// retry mid-walk on SFTP errors. After a Handle
+    /// replacement triggered from a downloader slot, the
+    /// walker's channel is dead. Fixing the walker's own
+    /// mid-walk resilience is separate work; this method
+    /// is only called from the downloader pool's retry
+    /// loop, which is what the production log shows is
+    /// hitting the bug.
+    pub(crate) async fn reconnect_handle_and_sftp(
+        handle: &Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>,
+        config: &Config,
+    ) -> anyhow::Result<Arc<RawSftpSession>> {
+        let mut h = handle.lock().await;
+        // Drop the old Handle by overwriting the slot. The
+        // old `Session` / `Handle`'s underlying transport
+        // closes when the last clone is dropped; we own the
+        // only one in the engine (the engine's Mutex), so
+        // the assignment is the last reference. (Other
+        // tasks have their own `Arc<RawSftpSession>` clones
+        // but those don't hold a `Handle` clone — the
+        // Handle lives only inside the engine's Mutex.)
+        *h = establish_russh_session(config).await
+            .context("Handle reconnect: failed to establish new russh session")?;
+        let new_raw = Self::open_sftp_session(&h).await
+            .context("Handle reconnect: failed to open SFTP subsystem on new Handle")?;
+        drop(h);
+        Ok(new_raw)
+    }
 }
 
 // =========================================================================
@@ -691,10 +775,12 @@ fn download_directory(
     db: &Database,
     dir_id: i64,
     max_retries: u32,
+    config: &Arc<Config>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
     let raw = Arc::clone(raw);
     let handle = Arc::clone(handle);
     let db = db.clone();
+    let config = Arc::clone(config);
     Box::pin(async move {
         info!(remote = %remote_path, local = %local_path, "downloading directory");
 
@@ -745,11 +831,12 @@ fn download_directory(
                     &db,
                     dir_id,
                     max_retries,
+                    &config,
                 ).await?;
             } else {
                 let remote_item = Path::new(&remote_item_str);
                 let local_item = Path::new(&local_item_str);
-                download_file(&raw, &handle, remote_item, local_item, &db, dir_id, &rel_path, max_retries).await?;
+                download_file(&raw, &handle, remote_item, local_item, &db, dir_id, &rel_path, max_retries, &config).await?;
             }
         }
 
@@ -777,6 +864,7 @@ async fn download_file(
     dir_id: i64,
     rel_path: &str,
     max_retries: u32,
+    config: &Arc<Config>,
 ) -> anyhow::Result<()> {
     let remote_str = remote.to_string_lossy().to_string();
 
@@ -872,32 +960,72 @@ async fn download_file(
                 // remote file" because the server thinks the
                 // channel is closed. Lock the Handle, open a
                 // fresh subsystem channel, and swap
-                // `current_raw` over to it. If the re-open
-                // itself fails, fall through with the old
-                // (broken) channel; the next attempt will
-                // likely fail the same way and exhaust the
-                // budget, marking the row `sync_failed`.
-                let h = handle.lock().await;
-                match SyncEngine::open_sftp_session(&h).await {
-                    Ok(new_raw) => {
-                        info!(
-                            file = %remote_str,
-                            attempt,
-                            "reopened SFTP channel for retry"
-                        );
-                        current_raw = new_raw;
-                    }
-                    Err(open_err) => {
-                        warn!(
-                            file = %remote_str,
-                            attempt,
-                            error = %open_err,
-                            "failed to reopen SFTP channel for retry; \
-                             continuing with current channel"
-                        );
+                // `current_raw` over to it.
+                //
+                // **Escalation.** If the channel re-open
+                // itself fails (e.g. `failed to open SSH
+                // channel for SFTP` from `channel_open_session`),
+                // the underlying SSH transport is sick, not
+                // just one channel. Escalate to a
+                // Handle-level reconnect: a fresh russh
+                // session (new TCP+SSH transport + public-
+                // key auth), then a fresh SFTP subsystem on
+                // the new Handle. The 2026-06-16 physalis
+                // production log shows the failure mode the
+                // escalation addresses — the channel re-open
+                // fails, we fall through with the dead
+                // channel, the next attempt fails
+                // identically, the budget is exhausted.
+                let mut recovered = false;
+                {
+                    let h = handle.lock().await;
+                    match SyncEngine::open_sftp_session(&h).await {
+                        Ok(new_raw) => {
+                            info!(
+                                file = %remote_str,
+                                attempt,
+                                "reopened SFTP channel for retry"
+                            );
+                            current_raw = new_raw;
+                            recovered = true;
+                        }
+                        Err(open_err) => {
+                            warn!(
+                                file = %remote_str,
+                                attempt,
+                                error = %open_err,
+                                "channel re-open failed; escalating to Handle-level reconnect"
+                            );
+                        }
                     }
                 }
-                drop(h);
+                if !recovered {
+                    // Drop the Handle lock before the
+                    // reconnect helper takes it again. The
+                    // helper does its own lock — releasing
+                    // here keeps the lock-hold time bounded
+                    // and avoids a self-deadlock if the
+                    // future impl ever nests the two lock
+                    // acquisitions.
+                    match SyncEngine::reconnect_handle_and_sftp(handle, config).await {
+                        Ok(new_raw) => {
+                            info!(
+                                file = %remote_str,
+                                attempt,
+                                "reconnected russh Handle for retry"
+                            );
+                            current_raw = new_raw;
+                        }
+                        Err(recon_err) => {
+                            warn!(
+                                file = %remote_str,
+                                attempt,
+                                error = %recon_err,
+                                "Handle reconnect failed; will retry on current channel"
+                            );
+                        }
+                    }
+                }
                 // 2^attempt seconds, capped at 30. attempt=1
                 // → 2s, attempt=2 → 4s, attempt=3 → 8s, etc.
                 let backoff_secs = 2u64.saturating_pow(attempt).min(30);
@@ -1208,6 +1336,13 @@ async fn try_download_file(
 struct PoolConfig {
     max_retries: u32,
     poll_interval: Duration,
+    /// Shared `Config` clone, used by the downloader retry
+    /// loop to perform a Handle-level reconnect (a fresh
+    /// russh `client::connect` + `authenticate_publickey`)
+    /// when the cheaper per-attempt SFTP channel re-open
+    /// fails. Held as `Arc<Config>` so each downloader task
+    /// can clone it cheaply.
+    config: Arc<Config>,
 }
 
 pub struct DownloaderPool {
@@ -1241,13 +1376,14 @@ impl DownloaderPool {
         handle: Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>,
         max_retries: u32,
         poll_interval: Duration,
+        config: Arc<Config>,
     ) -> Self {
         let (drain_tx, _drain_rx) = watch::channel(false);
         Self {
             downloader_channels,
             handle,
             drain_signal: Arc::new(drain_tx),
-            config: PoolConfig { max_retries, poll_interval },
+            config: PoolConfig { max_retries, poll_interval, config },
         }
     }
 
@@ -1279,6 +1415,12 @@ impl DownloaderPool {
         // access through the inner Mutex; the outer Arc just
         // shares ownership across the N downloader tasks.
         let handle = Arc::clone(&self.handle);
+        // Clone the Config Arc so each downloader task can
+        // perform a Handle-level reconnect (fresh
+        // `client::connect` + `authenticate_publickey`) when
+        // the per-attempt channel re-open fails. Cheap
+        // Arc clone; `Config` is `Clone` already.
+        let config = Arc::clone(&self.config.config);
         tokio::spawn(async move {
             // Spawn N downloader tasks. Each owns one channel.
             let mut set = JoinSet::new();
@@ -1286,8 +1428,9 @@ impl DownloaderPool {
                 let drain_rx = drain_rx.clone();
                 let db = db.clone();
                 let handle = Arc::clone(&handle);
+                let config = Arc::clone(&config);
                 set.spawn(async move {
-                    downloader_loop(slot_id, raw, handle, db, drain_rx, max_retries, poll_interval).await
+                    downloader_loop(slot_id, raw, handle, db, drain_rx, max_retries, poll_interval, config).await
                 });
             }
             // Await all downloader tasks. If any returns Err,
@@ -2140,6 +2283,7 @@ async fn downloader_loop(
     mut drain_signal: watch::Receiver<bool>,
     max_retries: u32,
     poll_interval: Duration,
+    config: Arc<Config>,
 ) -> anyhow::Result<()> {
     info!(slot = slot_id, "downloader: starting");
 
@@ -2209,6 +2353,7 @@ async fn downloader_loop(
             &db,
             claim.id,
             max_retries,
+            &config,
         ).await;
 
         match result {
@@ -2244,6 +2389,8 @@ async fn downloader_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -3097,10 +3244,12 @@ mod tests {
 
     /// Size matches, hash does NOT match. The local file is at
     /// the right size but with the wrong bytes — exactly the
-    /// silent-corruption case the user reported. Must error
-    /// loudly, not return `Trust` and let the file pass.
+    /// silent-corruption case the user reported. The disposition
+    /// must be `Download` (re-pull from SFTP), not `Trust` and
+    /// not `Err` (which would halt the walker). The mismatch is
+    /// still surfaced to the operator via a `warn!` log.
     #[tokio::test]
-    async fn test_verify_errs_on_hash_mismatch() {
+    async fn test_verify_downloads_on_hash_mismatch() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("file.bin");
         // Write the "actual" bytes; claim the hash is for
@@ -3108,16 +3257,16 @@ mod tests {
         let actual = b"what's actually on disk";
         tokio::fs::write(&path, actual).await.unwrap();
         let wrong_expected = sha256_hex(b"some other bytes entirely");
-        let err = verify_existing_file(
+        let got = verify_existing_file(
             &path,
             actual.len() as u64,
             actual.len() as u64,
             Some(&wrong_expected),
-        ).await.expect_err("hash mismatch must surface as Err, not as Trust");
-        let msg = format!("{:#}", err);
-        assert!(
-            msg.contains("sha256 mismatch") && msg.contains("expected") && msg.contains("got"),
-            "error should describe the mismatch, got: {}", msg
+        ).await.expect("hash mismatch must NOT surface as Err (that would halt the walker)");
+        assert_eq!(
+            got,
+            LocalFileDisposition::Download,
+            "hash mismatch should trigger re-download, not Trust"
         );
     }
 
@@ -4316,5 +4465,243 @@ mod tests {
         // `DockerContainer` Drop guard. Dropping `handle`
         // also drops the russh `Session`, which
         // disconnects.
+    }
+
+    /// Companion to `test_real_sftp_channel_reopen_after_dead_session`.
+    /// The channel re-open test simulates "one SFTP
+    /// channel died." This test simulates the harder
+    /// failure mode the 2026-06-16 physalis production
+    /// log shows: the *underlying SSH transport* is sick,
+    /// so even `channel_open_session` fails. The
+    /// escalation path inside `download_file`'s retry
+    /// loop calls `SyncEngine::reconnect_handle_and_sftp`,
+    /// which is a thin Mutex-swap wrapper around
+    /// `establish_russh_session` + `SyncEngine::open_sftp_session`.
+    /// This test exercises those two calls in sequence
+    /// against a real SSH server and confirms a fresh
+    /// Handle + fresh SFTP subsystem is functional.
+    ///
+    /// **Setup mirrors the channel re-open test** (same
+    /// atmoz/sftp image, same keypair, same `/big.bin`
+    /// source file). The "kill" step is different:
+    /// instead of closing one SFTP subsystem channel
+    /// (the cheap re-open case), this test explicitly
+    /// `disconnect`s the russh `Session` to model the
+    /// production failure where the SSH transport
+    /// itself is gone.
+    ///
+    /// **Gated.** Same docker + atmoz/sftp image
+    /// dependencies. Run with
+    /// `cargo test --release -- --ignored real_sftp`.
+    ///
+    /// **Why not also test the Mutex swap directly?**
+    /// `*h = establish_russh_session(...).await?` inside
+    /// `tokio::sync::Mutex` is the canonical
+    /// `tokio::sync::Mutex` swap pattern; testing it
+    /// would test tokio, not our code. The two real
+    /// calls under test are the high-value integration
+    /// points.
+    #[tokio::test]
+    #[ignore = "requires docker + atmoz/sftp image; run with --ignored. \
+                Fails (does not silently no-op) if preconditions are missing — \
+                this is opt-in because of the docker dependency, not because the \
+                outcome is conditional."]
+    async fn test_real_sftp_handle_reconnect_after_session_dead() {
+        use crate::sync::establish_russh_session;
+
+        // ---- 1. Pre-flight checks (same as the channel
+        //         re-open test) ----
+        if !real_sftp_docker_available() {
+            panic!(
+                "real_sftp preflight failed: `docker info` exited non-zero. \
+                 Install/start docker, or skip the real-SFTP tests by \
+                 omitting `--ignored`."
+            );
+        }
+        if !real_sftp_image_available() {
+            panic!(
+                "real_sftp preflight failed: atmoz/sftp:latest image not pulled. \
+                 Run `docker pull atmoz/sftp:latest` and re-run, or skip the \
+                 real-SFTP tests by omitting `--ignored`."
+            );
+        }
+
+        // ---- 2. Build a `Config` that points at the test
+        //         container's sshd + private key ----
+        //
+        // `establish_russh_session` takes `&Config` (the
+        // same path `SyncEngine::new` uses) so it can read
+        // host, port, user, and private_key_path. The
+        // other `Config` fields (db, paths, plex, etc.)
+        // are unused by `establish_russh_session` —
+        // `Config::default()` is `Deserialize` but not
+        // trivially constructible here, so we build just
+        // the `ssh` field with the values the test needs.
+        let key_dir = tempfile::tempdir().expect("tempdir for keys");
+        let key_dir_path = key_dir.path().to_path_buf();
+        let priv_key_path = generate_test_keypair(&key_dir_path)
+            .expect("keypair generation");
+
+        let staging = tempfile::tempdir().expect("staging tempdir");
+        let source_local = staging.path().join("source.bin");
+        {
+            use rand::RngCore;
+            let mut rng = rand::thread_rng();
+            let mut f = std::fs::File::create(&source_local).expect("create source");
+            let mut buf = vec![0u8; 1024 * 1024];
+            rng.fill_bytes(&mut buf);
+            use std::io::Write;
+            f.write_all(&mut buf).expect("write source");
+        }
+
+        let port: u16 = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind 0");
+            listener.local_addr().unwrap().port()
+        };
+
+        let container = start_sftp_container(&key_dir_path, port, &source_local)
+            .expect("start container");
+        wait_for_sshd(port).await.expect("sshd ready");
+
+        let ssh_config = crate::config::SshConfig {
+            host: "127.0.0.1".to_string(),
+            port: Some(port),
+            user: "test".to_string(),
+            private_key_path: priv_key_path.clone(),
+            remote_base_path: PathBuf::from("/"),
+        };
+        let test_config = Config {
+            ssh: ssh_config,
+            // Fields below are unused by
+            // `establish_russh_session` (which only reads
+            // `config.ssh.*`), but `Config` doesn't have a
+            // `..Default::default()` impl. Construct each
+            // minimally — values are placeholders.
+            database: crate::config::DatabaseConfig {
+                path: PathBuf::from("/tmp/nonexistent-test-db.sqlite"),
+            },
+            paths: crate::config::PathsConfig {
+                staging: PathBuf::from("/tmp/nonexistent-staging"),
+                library: PathBuf::from("/tmp/nonexistent-library"),
+            },
+            plex: crate::config::PlexConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                sections: HashMap::new(),
+            },
+            logging: None,
+            group_name: None,
+            categories: HashMap::new(),
+            metadata: crate::config::MetadataConfig::default(),
+            sync: crate::config::SyncConfig::default(),
+        };
+
+        // ---- 3. Establish Handle #1 (the production
+        //         initial-connect path) ----
+        let handle1 = establish_russh_session(&test_config)
+            .await
+            .expect("establish Handle #1");
+
+        // Wrap in a Mutex to mirror the production
+        // `SyncEngine` shape (the reconnect helper takes
+        // `&Arc<Mutex<Handle>>`).
+        let handle = Arc::new(tokio::sync::Mutex::new(handle1));
+
+        // Open subsystem #1 and confirm it works.
+        let sftp_path = "/big.bin";
+        let raw1 = {
+            let h = handle.lock().await;
+            SyncEngine::open_sftp_session(&h)
+                .await
+                .expect("open SFTP subsystem #1")
+        };
+        let attrs1 = raw1
+            .lstat(sftp_path.to_string())
+            .await
+            .expect("lstat on subsystem #1");
+        let expected_size = std::fs::metadata(&source_local).unwrap().len();
+        assert_eq!(
+            attrs1.attrs.size.unwrap_or(0) as u64, expected_size,
+            "subsystem #1 returned wrong size"
+        );
+
+        // ---- 4. Simulate the underlying SSH transport
+        //         going bad ----
+        //
+        // The production failure mode is "channel
+        // re-open fails because `channel_open_session`
+        // can't get a session channel on this Handle."
+        // We model that by `disconnect`ing the russh
+        // `Session` — the server gets an SSH DISCONNECT,
+        // and the Handle's underlying transport is now
+        // gone. A subsequent `open_sftp_session` on this
+        // Handle would fail (and that's the
+        // channel-re-open-fails case we're escalating
+        // from).
+        {
+            let h = handle.lock().await;
+            h.disconnect(
+                russh::Disconnect::ByApplication,
+                "test-simulated-handle-death",
+                "en",
+            ).await.expect("disconnect Handle #1");
+        }
+        // Give the server a moment to register the
+        // disconnect on its side. 100ms is cheap
+        // insurance.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // ---- 5. Escalation path: the production
+        //         `reconnect_handle_and_sftp` helper
+        //         does the equivalent of the next two
+        //         steps, wrapped in a Mutex swap. We
+        //         exercise the two free functions
+        //         directly; the 5-line Mutex-swap
+        //         wrapper around them is a standard
+        //         `tokio::sync::Mutex` swap and is
+        //         covered by code review. ----
+        let new_handle = establish_russh_session(&test_config)
+            .await
+            .expect("Handle reconnect: establish Handle #2");
+        // Simulate the Mutex swap from
+        // `reconnect_handle_and_sftp`: replace the inner
+        // Handle. We don't do the full swap here because
+        // we want to keep the test focused on the two
+        // free functions it integrates — see the
+        // function-level doc comment.
+        {
+            let mut h = handle.lock().await;
+            *h = new_handle;
+        }
+
+        // Open subsystem #2 on the new Handle.
+        let raw2 = {
+            let h = handle.lock().await;
+            SyncEngine::open_sftp_session(&h)
+                .await
+                .expect("open SFTP subsystem #2 after Handle reconnect")
+        };
+
+        // ---- 6. Verify subsystem #2 is functional ----
+        //
+        // The same `lstat` that worked on subsystem #1
+        // should work on subsystem #2. If the Handle
+        // reconnect somehow returned a broken session
+        // (e.g. auth failed silently, or the new
+        // subsystem bound to a dead channel), this
+        // `lstat` would fail or return wrong data.
+        let attrs2 = raw2
+            .lstat(sftp_path.to_string())
+            .await
+            .expect("lstat on subsystem #2 (after Handle reconnect)");
+        assert_eq!(
+            attrs2.attrs.size.unwrap_or(0) as u64, expected_size,
+            "subsystem #2 (after Handle reconnect) returned wrong size; \
+             the Handle-level reconnect path is not recovering correctly"
+        );
+
+        // ---- 7. Tear down ----
+        //
+        // Container cleaned up by `DockerContainer` Drop.
     }
 }
