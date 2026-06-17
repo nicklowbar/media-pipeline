@@ -19,7 +19,6 @@ pub enum DirectoryState {
     Syncing, Synced, SyncingFailed,
     Analyzing, Analyzed, AnalyzeFailed,
     Renaming, Renamed, RenameFailed,
-    Transcoding, Transcoded, TranscodeFailed,
     Moving, InLibrary, MoveFailed,
 }
 
@@ -36,9 +35,6 @@ impl DirectoryState {
             DirectoryState::Renaming => "renaming",
             DirectoryState::Renamed => "renamed",
             DirectoryState::RenameFailed => "rename_failed",
-            DirectoryState::Transcoding => "transcoding",
-            DirectoryState::Transcoded => "transcoded",
-            DirectoryState::TranscodeFailed => "transcode_failed",
             DirectoryState::Moving => "moving",
             DirectoryState::InLibrary => "in_library",
             DirectoryState::MoveFailed => "move_failed",
@@ -57,9 +53,6 @@ impl DirectoryState {
             "renaming" => Some(DirectoryState::Renaming),
             "renamed" => Some(DirectoryState::Renamed),
             "rename_failed" => Some(DirectoryState::RenameFailed),
-            "transcoding" => Some(DirectoryState::Transcoding),
-            "transcoded" => Some(DirectoryState::Transcoded),
-            "transcode_failed" => Some(DirectoryState::TranscodeFailed),
             "moving" => Some(DirectoryState::Moving),
             "in_library" => Some(DirectoryState::InLibrary),
             "move_failed" => Some(DirectoryState::MoveFailed),
@@ -171,6 +164,58 @@ fn table_needs_column(conn: &Connection, table: &str, column: &str) -> anyhow::R
     }
 }
 
+/// Returns `true` if `table` exists AND has a column named
+/// `column`. Used for idempotent ALTER TABLE ... DROP COLUMN
+/// migrations: if the column is present, the caller runs the
+/// ALTER; if it's already gone, the ALTER is skipped. Returns
+/// `false` if the table doesn't exist (no rows, no columns).
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Returns `true` if the `directories` table is on the
+/// per-phase-failed schema but still has the transcode states
+/// (`transcoding` / `transcoded`) in the `state` CHECK constraint.
+/// The transcode removal migration rebuilds the table to drop
+/// those states (and the `transcoded_at` column). Returns
+/// `false` if the table is missing or already on the new
+/// (transcode-free) schema.
+///
+/// Like `table_needs_migration`, this discriminates by
+/// inspecting `sqlite_master.sql`. The two schemas differ
+/// only by the CHECK constraint text and the `transcoded_at`
+/// column, so the discriminator is the presence of
+/// `transcode_failed` in the saved CREATE TABLE SQL.
+fn table_needs_transcode_removal(conn: &Connection) -> anyhow::Result<bool> {
+    let has_table: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='directories'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)?;
+    if !has_table {
+        return Ok(false);
+    }
+    let create_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='directories'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = create_sql else { return Ok(false); };
+    Ok(sql.contains("transcode_failed"))
+}
+
 impl Database {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)
@@ -206,7 +251,6 @@ impl Database {
                         'detected','syncing','synced','sync_failed',
                         'analyzing','analyzed','analyze_failed',
                         'renaming','renamed','rename_failed',
-                        'transcoding','transcoded','transcode_failed',
                         'moving','in_library','move_failed')),
                     manifest_hash   TEXT,
                     detected_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -214,7 +258,6 @@ impl Database {
                     syncing_at      DATETIME,
                     analyzed_at     DATETIME,
                     renamed_at      DATETIME,
-                    transcoded_at   DATETIME,
                     moved_at        DATETIME,
                     detected_policy TEXT,
                     plex_scan_at    DATETIME,
@@ -224,15 +267,84 @@ impl Database {
                 INSERT INTO directories_new
                     (id, category, remote_path, staging_path, library_path,
                      state, manifest_hash, detected_at, synced_at, syncing_at,
-                     analyzed_at, renamed_at, transcoded_at, moved_at,
+                     analyzed_at, renamed_at, moved_at,
                      detected_policy, plex_scan_at, error_message)
                 SELECT
                     id, category, remote_path, staging_path, library_path,
                     CASE WHEN state = 'failed' THEN 'detected' ELSE state END,
                     manifest_hash, detected_at, synced_at, NULL,
-                    analyzed_at, renamed_at, transcoded_at, moved_at,
+                    analyzed_at, renamed_at, moved_at,
                     detected_policy, plex_scan_at,
                     CASE WHEN state = 'failed' THEN NULL ELSE error_message END
+                FROM directories;
+                DROP TABLE directories;
+                ALTER TABLE directories_new RENAME TO directories;
+                COMMIT;
+                "#,
+            )?;
+        }
+
+        // If the table has the per-phase CHECK constraint (post
+        // table_needs_migration migration) but still has the
+        // transcode states and the `transcoded_at` column, drop
+        // them now. Library-side re-encoding is owned by Tdarr
+        // (see memory/architecture-pipeline-vs-tdarr.md); the
+        // transcode state machine is dead code.
+        //
+        // `syncing_at` is read as `NULL` here because the OLD
+        // table may or may not have the column (it's added
+        // separately by the `table_needs_column` check below
+        // if missing). Either way, the new table is created
+        // with the column present, so this is safe.
+        if table_needs_transcode_removal(&conn)? {
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE directories_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category        TEXT NOT NULL,
+                    remote_path     TEXT NOT NULL,
+                    staging_path    TEXT NOT NULL,
+                    library_path    TEXT,
+                    state           TEXT NOT NULL CHECK(state IN (
+                        'detected','syncing','synced','sync_failed',
+                        'analyzing','analyzed','analyze_failed',
+                        'renaming','renamed','rename_failed',
+                        'moving','in_library','move_failed')),
+                    manifest_hash   TEXT,
+                    detected_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    synced_at       DATETIME,
+                    syncing_at      DATETIME,
+                    analyzed_at     DATETIME,
+                    renamed_at      DATETIME,
+                    moved_at        DATETIME,
+                    detected_policy TEXT,
+                    plex_scan_at    DATETIME,
+                    error_message   TEXT,
+                    UNIQUE(category, remote_path)
+                );
+                INSERT INTO directories_new
+                    (id, category, remote_path, staging_path, library_path,
+                     state, manifest_hash, detected_at, synced_at, syncing_at,
+                     analyzed_at, renamed_at, moved_at,
+                     detected_policy, plex_scan_at, error_message)
+                SELECT
+                    id, category, remote_path, staging_path, library_path,
+                    -- Transcode state rows are reset to 'renamed'
+                    -- (the input state for the move phase, which
+                    -- is what `transcode_failed` already mapped
+                    -- to — same recovery as `*Failed → input`).
+                    -- `transcode_failed` rows are reset to
+                    -- `renamed` too, since their work has
+                    -- already been done (rename + analyze
+                    -- succeeded; the transcode step is gone).
+                    CASE
+                        WHEN state IN ('transcoding','transcoded','transcode_failed') THEN 'renamed'
+                        ELSE state
+                    END,
+                    manifest_hash, detected_at, synced_at, NULL,
+                    analyzed_at, renamed_at, moved_at,
+                    detected_policy, plex_scan_at, error_message
                 FROM directories;
                 DROP TABLE directories;
                 ALTER TABLE directories_new RENAME TO directories;
@@ -253,7 +365,6 @@ impl Database {
                     'detected','syncing','synced','sync_failed',
                     'analyzing','analyzed','analyze_failed',
                     'renaming','renamed','rename_failed',
-                    'transcoding','transcoded','transcode_failed',
                     'moving','in_library','move_failed')),
                 manifest_hash   TEXT,
                 detected_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -261,7 +372,6 @@ impl Database {
                 syncing_at      DATETIME,
                 analyzed_at     DATETIME,
                 renamed_at      DATETIME,
-                transcoded_at   DATETIME,
                 moved_at        DATETIME,
                 detected_policy TEXT,
                 plex_scan_at    DATETIME,
@@ -273,11 +383,7 @@ impl Database {
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 dir_id              INTEGER NOT NULL REFERENCES directories(id) ON DELETE CASCADE,
                 original_name       TEXT NOT NULL,
-                renamed_name        TEXT,
-                transcode_policy    TEXT,
-                transcode_status    TEXT CHECK(transcode_status IN ('pending','in_progress','done','failed')),
-                needs_transcode     INTEGER NOT NULL DEFAULT 0,
-                final_name          TEXT
+                renamed_name        TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_dirs_state ON directories(state);
@@ -302,6 +408,17 @@ impl Database {
         // have the per-phase-failed schema but not `syncing_at`.)
         if table_needs_column(&conn, "directories", "syncing_at")? {
             conn.execute_batch("ALTER TABLE directories ADD COLUMN syncing_at DATETIME")?;
+        }
+
+        // Drop the transcode columns from the files table.
+        // SQLite 3.35+ supports ALTER TABLE ... DROP COLUMN,
+        // which removes the column and any CHECK constraint
+        // on it. Each ALTER is wrapped in a `table_has_column`
+        // check so the migration is idempotent.
+        for col in ["transcode_policy", "transcode_status", "needs_transcode", "final_name"] {
+            if table_has_column(&conn, "files", col)? {
+                conn.execute_batch(&format!("ALTER TABLE files DROP COLUMN {}", col))?;
+            }
         }
 
         conn.execute_batch(
@@ -404,23 +521,20 @@ impl Database {
                     WHEN directories.state = 'sync_failed'     THEN 'detected'
                     WHEN directories.state = 'analyze_failed'  THEN 'synced'
                     WHEN directories.state = 'rename_failed'   THEN 'analyzed'
-                    WHEN directories.state = 'transcode_failed' THEN 'renamed'
                     WHEN directories.state = 'move_failed'     THEN 'renamed'
                     ELSE directories.state
                 END,
                 detected_at = CASE
                     WHEN directories.manifest_hash != excluded.manifest_hash THEN CURRENT_TIMESTAMP
                     WHEN directories.state IN (
-                        'sync_failed','analyze_failed','rename_failed',
-                        'transcode_failed','move_failed'
+                        'sync_failed','analyze_failed','rename_failed','move_failed'
                     ) THEN CURRENT_TIMESTAMP
                     ELSE directories.detected_at
                 END,
                 error_message = CASE
                     WHEN directories.manifest_hash != excluded.manifest_hash THEN NULL
                     WHEN directories.state IN (
-                        'sync_failed','analyze_failed','rename_failed',
-                        'transcode_failed','move_failed'
+                        'sync_failed','analyze_failed','rename_failed','move_failed'
                     ) THEN NULL
                     ELSE directories.error_message
                 END
@@ -641,6 +755,96 @@ impl Database {
         Ok(n)
     }
 
+    /// Count rows in the given state by name. Used by the
+    /// generic `WorkerPool<W>` drain check: each pool passes
+    /// `W::claim_state()` and exits when the count is 0 after
+    /// `signal_drain`.
+    ///
+    /// `state` is a raw string (e.g. `"synced"`, `"analyzed"`,
+    /// `"renamed"`) rather than a `DirectoryState` enum value
+    /// because the worker pool is generic over `W: Worker` and
+    /// the `Worker` trait's `claim_state()` returns
+    /// `&'static str` to avoid leaking the enum into the
+    /// trait's surface. The CHECK constraint on the column
+    /// still validates the value.
+    pub fn count_directories_in_state(&self, state: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM directories WHERE state = ?1",
+            params![state],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Atomic claim for the process pools. Each helper is
+    /// structurally identical to `claim_detected_row` —
+    /// one statement, atomic, returns the row — but with the
+    /// source and in-flight states parameterized for the
+    /// three new pools:
+    ///
+    /// - `claim_synced_row`:    `Synced`    → `Analyzing` (analyze pool)
+    /// - `claim_analyzed_row`:  `Analyzed`  → `Renaming`  (rename pool)
+    /// - `claim_renamed_row`:   `Renamed`   → `Moving`    (move pool)
+    ///
+    /// No timestamp column is set on the in-flight transition
+    /// (the `*ing` states don't have one — only the `Syncing`
+    /// state has a `syncing_at` column for the stale-Syncing
+    /// sweep). The pool's success path calls
+    /// `set_directory_state` which sets the appropriate
+    /// timestamp column for the `*ed` state.
+    pub fn claim_synced_row(&self) -> anyhow::Result<Option<DirectoryRow>> {
+        self.claim_process_row("synced", "analyzing")
+    }
+
+    pub fn claim_analyzed_row(&self) -> anyhow::Result<Option<DirectoryRow>> {
+        self.claim_process_row("analyzed", "renaming")
+    }
+
+    pub fn claim_renamed_row(&self) -> anyhow::Result<Option<DirectoryRow>> {
+        self.claim_process_row("renamed", "moving")
+    }
+
+    /// Internal: one atomic UPDATE...RETURNING that picks the
+    /// oldest row in `claim_state` and transitions it to
+    /// `in_flight_state`. Used by the three process-pool claim
+    /// helpers above. Mirrors `claim_detected_row` exactly
+    /// except for the state strings.
+    fn claim_process_row(
+        &self,
+        claim_state: &str,
+        in_flight_state: &str,
+    ) -> anyhow::Result<Option<DirectoryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "UPDATE directories
+                SET state = ?1
+              WHERE id = (
+                  SELECT id FROM directories
+                   WHERE state = ?2
+                   ORDER BY detected_at ASC
+                   LIMIT 1
+              )
+                AND state = ?2
+              RETURNING id, category, remote_path, staging_path",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![in_flight_state, claim_state])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let id: i64 = row.get(0)?;
+        let category: String = row.get(1)?;
+        let remote_path: String = row.get(2)?;
+        let staging_path: String = row.get(3)?;
+        Ok(Some(DirectoryRow {
+            id,
+            category,
+            remote_path,
+            staging_path,
+        }))
+    }
+
     /// Sweep rows stuck in `Syncing` longer than `max_age_hours`
     /// back to `Detected`. Called once at downloader-pool startup
     /// so a row claimed by a process that crashed mid-download is
@@ -687,7 +891,6 @@ impl Database {
             DirectoryState::SyncingFailed    => Some(DirectoryState::Detected),
             DirectoryState::AnalyzeFailed   => Some(DirectoryState::Synced),
             DirectoryState::RenameFailed    => Some(DirectoryState::Analyzed),
-            DirectoryState::TranscodeFailed => Some(DirectoryState::Renamed),
             DirectoryState::MoveFailed      => Some(DirectoryState::Renamed),
             _ => None,
         }
@@ -701,7 +904,6 @@ impl Database {
             DirectoryState::Synced => "synced_at",
             DirectoryState::Analyzed => "analyzed_at",
             DirectoryState::Renamed => "renamed_at",
-            DirectoryState::Transcoded => "transcoded_at",
             DirectoryState::InLibrary => "moved_at",
             _ => "detected_at",
         };
@@ -771,7 +973,7 @@ impl Database {
     ) -> anyhow::Result<Vec<DirectoryRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, category, remote_path, staging_path, library_path, state, manifest_hash, detected_at, synced_at, analyzed_at, renamed_at, transcoded_at, moved_at, detected_policy, plex_scan_at, error_message
+            "SELECT id, category, remote_path, staging_path, library_path, state, manifest_hash, detected_at, synced_at, analyzed_at, renamed_at, moved_at, detected_policy, plex_scan_at, error_message
              FROM directories WHERE state = ?1"
         )?;
 
@@ -788,11 +990,10 @@ impl Database {
                 synced_at: row.get(8)?,
                 analyzed_at: row.get(9)?,
                 renamed_at: row.get(10)?,
-                transcoded_at: row.get(11)?,
-                moved_at: row.get(12)?,
-                detected_policy: row.get(13)?,
-                plex_scan_at: row.get(14)?,
-                error_message: row.get(15)?,
+                moved_at: row.get(11)?,
+                detected_policy: row.get(12)?,
+                plex_scan_at: row.get(13)?,
+                error_message: row.get(14)?,
             })
         })?;
 
@@ -806,7 +1007,7 @@ impl Database {
     pub fn get_directory_by_id(&self, id: i64) -> anyhow::Result<Option<DirectoryRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, category, remote_path, staging_path, library_path, state, manifest_hash, detected_at, synced_at, analyzed_at, renamed_at, transcoded_at, moved_at, detected_policy, plex_scan_at, error_message
+            "SELECT id, category, remote_path, staging_path, library_path, state, manifest_hash, detected_at, synced_at, analyzed_at, renamed_at, moved_at, detected_policy, plex_scan_at, error_message
              FROM directories WHERE id = ?1"
         )?;
 
@@ -823,11 +1024,10 @@ impl Database {
                 synced_at: row.get(8)?,
                 analyzed_at: row.get(9)?,
                 renamed_at: row.get(10)?,
-                transcoded_at: row.get(11)?,
-                moved_at: row.get(12)?,
-                detected_policy: row.get(13)?,
-                plex_scan_at: row.get(14)?,
-                error_message: row.get(15)?,
+                moved_at: row.get(11)?,
+                detected_policy: row.get(12)?,
+                plex_scan_at: row.get(13)?,
+                error_message: row.get(14)?,
             })
         }).optional()?;
         Ok(row)
@@ -838,14 +1038,11 @@ impl Database {
         &self,
         dir_id: i64,
         original_name: &str,
-        transcode_policy: &str,
-        needs_transcode: bool,
     ) -> anyhow::Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO files (dir_id, original_name, transcode_policy, needs_transcode, transcode_status)
-             VALUES (?1, ?2, ?3, ?4, 'pending')",
-            params![dir_id, original_name, transcode_policy, needs_transcode as i32],
+            "INSERT INTO files (dir_id, original_name) VALUES (?1, ?2)",
+            params![dir_id, original_name],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -858,18 +1055,10 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_file_final(&self, id: i64, final_name: &str, status: &str) -> anyhow::Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE files SET final_name = ?1, transcode_status = ?2 WHERE id = ?3",
-            params![final_name, status, id],
-        )?;
-        Ok(())
-    }
-
     pub fn get_files_for_directory(&self, dir_id: i64) -> anyhow::Result<Vec<FileRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, dir_id, original_name, renamed_name, transcode_policy, transcode_status, needs_transcode, final_name
+            "SELECT id, dir_id, original_name, renamed_name
              FROM files WHERE dir_id = ?1"
         )?;
 
@@ -879,10 +1068,6 @@ impl Database {
                 dir_id: row.get(1)?,
                 original_name: row.get(2)?,
                 renamed_name: row.get(3)?,
-                transcode_policy: row.get(4)?,
-                transcode_status: row.get(5)?,
-                needs_transcode: row.get::<_, i32>(6)? != 0,
-                final_name: row.get(7)?,
             })
         })?;
 
@@ -1036,7 +1221,6 @@ pub struct DirectoryRecord {
     pub detected_at: Option<String>,
     pub synced_at: Option<String>,
     pub renamed_at: Option<String>,
-    pub transcoded_at: Option<String>,
     pub moved_at: Option<String>,
     pub detected_policy: Option<String>,
     pub plex_scan_at: Option<String>,
@@ -1050,10 +1234,6 @@ pub struct FileRecord {
     pub dir_id: i64,
     pub original_name: String,
     pub renamed_name: Option<String>,
-    pub transcode_policy: Option<String>,
-    pub transcode_status: Option<String>,
-    pub needs_transcode: bool,
-    pub final_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -1117,14 +1297,12 @@ mod tests {
         db.set_directory_state(dir.id, DirectoryState::Synced).unwrap();
         db.set_directory_state(dir.id, DirectoryState::Analyzed).unwrap();
         db.set_directory_state(dir.id, DirectoryState::Renamed).unwrap();
-        db.set_directory_state(dir.id, DirectoryState::Transcoded).unwrap();
         db.set_directory_state(dir.id, DirectoryState::InLibrary).unwrap();
 
         let in_lib = db.get_directories_in_state(DirectoryState::InLibrary).unwrap();
         assert_eq!(in_lib.len(), 1);
         assert!(in_lib[0].synced_at.is_some());
         assert!(in_lib[0].renamed_at.is_some());
-        assert!(in_lib[0].transcoded_at.is_some());
         assert!(in_lib[0].moved_at.is_some());
     }
 
@@ -1154,22 +1332,17 @@ mod tests {
         let db = in_memory_db();
         db.upsert_directory("movies", "/srv/data/media/movies/Foo", "/staging/Movies/Foo", "hash123").unwrap();
 
-        let file_id = db.insert_file(1, "movie.mkv", "x264_to_x265", true).unwrap();
+        let file_id = db.insert_file(1, "movie.mkv").unwrap();
         assert_eq!(file_id, 1);
 
         let files = db.get_files_for_directory(1).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].original_name, "movie.mkv");
-        assert_eq!(files[0].transcode_status, Some("pending".to_string()));
-        assert!(files[0].needs_transcode);
 
         db.update_file_renamed(1, "movie-x265-NXELE.mkv").unwrap();
-        db.update_file_final(1, "movie-x265-NXELE.mkv", "done").unwrap();
 
         let files = db.get_files_for_directory(1).unwrap();
         assert_eq!(files[0].renamed_name, Some("movie-x265-NXELE.mkv".to_string()));
-        assert_eq!(files[0].final_name, Some("movie-x265-NXELE.mkv".to_string()));
-        assert_eq!(files[0].transcode_status, Some("done".to_string()));
     }
 
     #[test]
@@ -1395,14 +1568,13 @@ mod tests {
     }
 
     /// Each `*Failed` variant maps to its own input state. Cover all
-    /// five mappings in a single table-driven test.
+    /// four mappings in a single table-driven test.
     #[test]
     fn test_each_failed_variant_resets_to_correct_input_state() {
         let cases: &[(DirectoryState, DirectoryState, &str)] = &[
             (DirectoryState::SyncingFailed,    DirectoryState::Detected, "hash-sync"),
             (DirectoryState::AnalyzeFailed,   DirectoryState::Synced,   "hash-ana"),
             (DirectoryState::RenameFailed,    DirectoryState::Analyzed, "hash-ren"),
-            (DirectoryState::TranscodeFailed, DirectoryState::Renamed,  "hash-tra"),
             (DirectoryState::MoveFailed,      DirectoryState::Renamed,  "hash-mov"),
         ];
         for (i, (failed, expected, hash)) in cases.iter().enumerate() {
@@ -1537,8 +1709,6 @@ mod tests {
             DirectoryState::Analyzed,
             DirectoryState::Renaming,
             DirectoryState::Renamed,
-            DirectoryState::Transcoding,
-            DirectoryState::Transcoded,
             DirectoryState::Moving,
             DirectoryState::InLibrary,
         ] {

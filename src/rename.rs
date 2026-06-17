@@ -10,7 +10,6 @@ use walkdir::WalkDir;
 use crate::config::Config;
 use crate::db::Database;
 use crate::metadata::MetadataLookup;
-use crate::policy::DetectedPolicy;
 
 lazy_static! {
     /// Inner-codec swap, used after the group is swapped. Catches codec
@@ -428,11 +427,14 @@ pub async fn rename_directory(
     category: &str,
     db: &Database,
     dir_id: i64,
-    detected_policy: Option<&DetectedPolicy>,
     lookup: &dyn MetadataLookup,
 ) -> anyhow::Result<Option<crate::metadata::CanonicalTitle>> {
     let group_name = config.group_name();
-    let will_change_codec = detected_policy.map(|p| p.changes_codec()).unwrap_or(false);
+    // Transcode policy is a no-op now (Tdarr owns library-side
+    // re-encoding; see memory/architecture-pipeline-vs-tdarr.md),
+    // so the rename path never inserts a codec tag. The local
+    // `will_change_codec` flag is hard-coded to false.
+    let will_change_codec = false;
 
     // Walk directory and collect files.
     let mut files = Vec::new();
@@ -532,17 +534,58 @@ pub async fn rename_directory(
         std::fs::rename(old_path, new_path)
             .with_context(|| format!("failed to rename {} to {}", old_path.display(), new_path.display()))?;
 
+        // Record the file in the audit table. The
+        // `original_name` column captures the name on disk
+        // at this point in the pipeline (i.e. the name
+        // *before* `fs::rename`); the `renamed_name` column
+        // captures the name after the rename. Together
+        // they form a per-file audit trail — an operator
+        // querying the `files` table can see exactly what
+        // each file was renamed to. Without the
+        // `update_file_renamed` call the audit trail would
+        // show only the pre-rename name, which isn't
+        // useful for debugging a misrename after the fact.
         let original = old_path.file_name().unwrap().to_string_lossy();
-        let policy_str = detected_policy.map(|p| p.as_str()).unwrap_or("none");
-        db.insert_file(
-            dir_id,
-            &original,
-            policy_str,
-            is_video_file(new_path),
-        )?;
+        let new_name = new_path.file_name().unwrap().to_string_lossy();
+        let file_id = db.insert_file(dir_id, &original)?;
+        db.update_file_renamed(file_id, &new_name)?;
     }
 
-    info!(dir_id, count = rename_map.len(), "directory renamed");
+    // Summary log. The primary file's from→to is the
+    // single most informative line for an operator (it
+    // shows the noisy release name on the left and the
+    // clean post-rename name on the right). For
+    // directories without a primary video (rare; the
+    // rename is a no-op group-swap) we still log the
+    // count. The per-file `trace!` line above stays at
+    // trace level so a directory with 30+ files doesn't
+    // flood the operator log; the info-level summary
+    // here is the one-liner the operator reads.
+    let primary_from_to = primary_video.and_then(|(full, _)| {
+        let from_name = full.file_name()?.to_string_lossy().into_owned();
+        let new_name = rename_map.get(full)
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        new_name.map(|n| (from_name, n))
+    });
+    match primary_from_to {
+        Some((from, to)) => {
+            info!(
+                dir_id,
+                from = %from,
+                to = %to,
+                count = rename_map.len(),
+                "directory renamed"
+            );
+        }
+        None => {
+            info!(
+                dir_id,
+                count = rename_map.len(),
+                "directory renamed (no primary video)"
+            );
+        }
+    }
     Ok(canonical_title)
 }
 
@@ -1309,7 +1352,6 @@ mod tests {
             "movies",
             &db,
             dir_id,
-            None,
             &lookup,
         ).await;
         assert!(result.is_ok(), "rename_directory failed: {:?}", result.err());
@@ -1350,7 +1392,6 @@ mod tests {
             "movies",
             &db,
             dir_id,
-            None,
             &noop,
         ).await;
         assert!(result.is_ok());
@@ -1358,6 +1399,22 @@ mod tests {
 
         let renamed = staging.join("Shoresy.S05E03.1080p.HEVC.x265-REPACK.mkv");
         assert!(renamed.exists());
+
+        // The per-file audit trail should record both the
+        // pre-rename name (`original_name`) and the
+        // post-rename name (`renamed_name`) so an operator
+        // can see exactly what each file became. Without the
+        // `update_file_renamed` call in the rename loop the
+        // `renamed_name` column would be NULL, which would
+        // make the audit trail useless for debugging a
+        // misrename after the fact.
+        let files = db.get_files_for_directory(dir_id).unwrap();
+        assert_eq!(files.len(), 1, "one file should be recorded");
+        assert_eq!(files[0].original_name, "Shoresy.S05E03.1080p.HEVC.x265-MeGusta.mkv");
+        assert_eq!(
+            files[0].renamed_name.as_deref(),
+            Some("Shoresy.S05E03.1080p.HEVC.x265-REPACK.mkv"),
+        );
     }
 
     #[tokio::test]
@@ -1404,7 +1461,6 @@ mod tests {
             "tvshows",
             &db,
             dir_id,
-            None,
             &lookup,
         ).await;
         let canonical = result.expect("rename should succeed");

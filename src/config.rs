@@ -35,6 +35,12 @@ pub mod env {
     /// negative integer; values that don't parse as `u32` are
     /// ignored. Default is 2 in-code (= 3 total attempts).
     pub const SYNC_MAX_DOWNLOAD_RETRIES: &str = "MEDIA_PIPELINE_SYNC_MAX_DOWNLOAD_RETRIES";
+    /// Override for the top-level `group_name` field (the release
+    /// group that the renamer splices into the file basename).
+    /// Defaults to "REPACK" if unset (or empty). Useful in container
+    /// deployments where the TOML is shared across instances and a
+    /// per-instance group tag is needed.
+    pub const GROUP_NAME: &str = "MEDIA_PIPELINE_GROUP_NAME";
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,28 +104,7 @@ pub struct LoggingConfig {
 pub struct CategoryConfig {
     pub remote_dir: String,
     pub library_folder: String,
-    /// Optional default transcode policy for this category.
-    /// If omitted, the pipeline will auto-detect per-title.
-    pub transcode_policy: Option<TranscodePolicy>,
     pub plex_section: Option<i64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TranscodePolicy {
-    None,
-    X264ToX265,
-    Downscale1080p,
-}
-
-impl TranscodePolicy {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TranscodePolicy::None => "none",
-            TranscodePolicy::X264ToX265 => "x264_to_x265",
-            TranscodePolicy::Downscale1080p => "downscale_1080p",
-        }
-    }
 }
 
 /// Configuration for the metadata-lookup step. The TMDB API key
@@ -238,6 +223,10 @@ impl Config {
         }
         // Sync-phase tunables. Apply after TOML parse so env wins.
         apply_env_u32(&mut self.sync.max_download_retries, env::SYNC_MAX_DOWNLOAD_RETRIES);
+        // Group name. Apply after TOML parse so env wins. An
+        // unset env var leaves the TOML value (or the in-code
+        // default of "REPACK") alone.
+        apply_env_option_string(&mut self.group_name, env::GROUP_NAME);
     }
 
     /// Convenience: load the config file and apply env-var overrides
@@ -322,6 +311,20 @@ fn apply_env_u32(target: &mut Option<u32>, var: &str) {
             if let Ok(parsed) = value.parse::<u32>() {
                 *target = Some(parsed);
             }
+        }
+    }
+}
+
+/// `Option<String>`-flavored version of `apply_env_string`. Sets
+/// the target to `Some(value)` if the env var is set and
+/// non-empty; leaves the target unchanged otherwise. We do NOT
+/// clear an existing `Some` value on an empty/unset env var
+/// because that would let a missing env var override a TOML
+/// value — opposite of the intended precedence.
+fn apply_env_option_string(target: &mut Option<String>, var: &str) {
+    if let Ok(value) = std::env::var(var) {
+        if !value.is_empty() {
+            *target = Some(value);
         }
     }
 }
@@ -440,13 +443,6 @@ library_folder = "TvShows"
     }
 
     #[test]
-    fn test_transcode_policy_as_str() {
-        assert_eq!(TranscodePolicy::None.as_str(), "none");
-        assert_eq!(TranscodePolicy::X264ToX265.as_str(), "x264_to_x265");
-        assert_eq!(TranscodePolicy::Downscale1080p.as_str(), "downscale_1080p");
-    }
-
-    #[test]
     fn test_default_group_name() {
         let toml = r#"
 [ssh]
@@ -472,6 +468,92 @@ library_folder = "Movies"
         let temp = create_temp_config(toml);
         let config = Config::load(temp.path()).unwrap();
         assert_eq!(config.group_name(), "REPACK");
+    }
+
+    #[test]
+    fn test_group_name_env_override() {
+        // The TOML field is the source of truth, but the
+        // `MEDIA_PIPELINE_GROUP_NAME` env var overrides it at
+        // load time. This is the same precedence as every
+        // other env-tunable field (env wins over TOML).
+        let _env = ENV_LOCK.lock().unwrap();
+
+        // Case 1: TOML has a value, env unset → TOML wins.
+        let toml_with_group = r#"
+group_name = "FINFUNNEL"
+
+[ssh]
+host = "downloads.example.com"
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+[plex]
+url = "http://plex:32400"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+"#;
+        let temp = create_temp_config(toml_with_group);
+        std::env::remove_var(env::GROUP_NAME);
+        let mut config = Config::load(temp.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.group_name(), "FINFUNNEL");
+
+        // Case 2: TOML has a value, env set → env wins.
+        std::env::set_var(env::GROUP_NAME, "N3IGHB0R");
+        let mut config = Config::load(temp.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.group_name(), "N3IGHB0R");
+        std::env::remove_var(env::GROUP_NAME);
+
+        // Case 3: TOML has no value, env set → env fills in.
+        let toml_no_group = r#"
+[ssh]
+host = "downloads.example.com"
+user = "mediapipe"
+private_key_path = "/root/.ssh/id_rsa"
+remote_base_path = "/srv/data/media"
+
+[database]
+path = "/data/pipeline.db"
+
+[paths]
+staging = "/staging"
+library = "/library"
+
+[plex]
+url = "http://plex:32400"
+
+[categories.movies]
+remote_dir = "movies"
+library_folder = "Movies"
+"#;
+        let temp = create_temp_config(toml_no_group);
+        std::env::set_var(env::GROUP_NAME, "BARLEY");
+        let mut config = Config::load(temp.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.group_name(), "BARLEY");
+        std::env::remove_var(env::GROUP_NAME);
+
+        // Case 4: env set to empty string → TOML is
+        // untouched (empty env var is treated as unset,
+        // not as "set to empty"). This is the typo guard
+        // every other env-tunable field has.
+        let temp4 = create_temp_config(toml_with_group);
+        std::env::set_var(env::GROUP_NAME, "");
+        let mut config = Config::load(temp4.path()).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.group_name(), "FINFUNNEL");
+        std::env::remove_var(env::GROUP_NAME);
     }
 
     #[test]

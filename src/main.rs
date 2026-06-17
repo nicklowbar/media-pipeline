@@ -14,14 +14,14 @@ mod pipeline;
 mod policy;
 mod rename;
 mod sync;
-mod transcode;
+mod worker_pool;
 
 use crate::config::Config;
 use crate::db::Database;
 
 #[derive(Parser)]
 #[command(name = "media-pipeline")]
-#[command(about = "Automated media sync, rename, transcode, and ingest pipeline")]
+#[command(about = "Automated media sync, rename, and ingest pipeline")]
 struct Cli {
     #[arg(
         short, long, value_name = "FILE",
@@ -38,12 +38,6 @@ struct Cli {
 enum Commands {
     /// Run the full pipeline
     Run,
-    /// Run only the sync phase
-    #[command(name = "sync-only")]
-    SyncOnly,
-    /// Run only the process phase (rename + transcode + move)
-    #[command(name = "process-only")]
-    ProcessOnly,
     /// Show pipeline status
     Status,
     /// Seed the database from existing staging / library directories
@@ -92,14 +86,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run => {
             info!("running full pipeline");
             pipeline::run_full(&config, &db).await?;
-        }
-        Commands::SyncOnly => {
-            info!("running sync phase only");
-            pipeline::run_sync(&config, &db).await?;
-        }
-        Commands::ProcessOnly => {
-            info!("running process phase only");
-            pipeline::run_process(&config, &db).await?;
         }
         Commands::Status => {
             pipeline::print_status(&db)?;

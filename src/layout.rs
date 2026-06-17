@@ -154,7 +154,6 @@ mod tests {
                     crate::config::CategoryConfig {
                         remote_dir: "movies".to_string(),
                         library_folder: library_base.file_name().unwrap().to_string_lossy().to_string(),
-                        transcode_policy: None,
                         plex_section: None,
                     },
                 );
@@ -163,7 +162,6 @@ mod tests {
                     crate::config::CategoryConfig {
                         remote_dir: "tv".to_string(),
                         library_folder: "TvShows".to_string(),
-                        transcode_policy: None,
                         plex_section: None,
                     },
                 );
@@ -172,7 +170,6 @@ mod tests {
                     crate::config::CategoryConfig {
                         remote_dir: "music".to_string(),
                         library_folder: "Music".to_string(),
-                        transcode_policy: None,
                         plex_section: None,
                     },
                 );
@@ -309,7 +306,6 @@ mod tests {
             crate::config::CategoryConfig {
                 remote_dir: "games".to_string(),
                 library_folder: "Games".to_string(),
-                transcode_policy: None,
                 plex_section: None,
             },
         );
