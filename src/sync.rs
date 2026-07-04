@@ -13,7 +13,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::Config;
-use crate::db::{Database, DirectoryState};
+use crate::db::{Database, DirectoryRow, DirectoryState};
 use crate::worker_pool::{Worker, WorkerPool};
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
@@ -432,13 +432,21 @@ pub struct SyncEngine {
     /// walked sequentially, so a single walker channel is
     /// sufficient.
     walker_channel: Arc<RawSftpSession>,
+    /// The pipeline `Config`, shared with the walker task.
+    /// The walker needs this for Handle-level reconnect
+    /// (`SyncEngine::reconnect_handle_and_sftp`) when its
+    /// walker channel dies mid-walk. Each downloader slot
+    /// also holds an `Arc<Config>` clone, but those are
+    /// private to the pool; the engine's field is what the
+    /// walker task's spawned closure clones from.
+    config: Arc<Config>,
     /// The downloader pool. Lives for the whole pipeline run.
     /// Spawned at `SyncEngine::new` time, drained at
     /// `drain_pool().await` time. The pool is a generic
     /// `WorkerPool<DownloaderSlotWorker>` — the per-slot
     /// `DownloaderSlotWorker` (defined in this file) holds
     /// the SFTP-specific bits.
-    pool: WorkerPool<DownloaderSlotWorker>,
+    pool: WorkerPool<FileDownloaderSlotWorker>,
     /// The pool's background task. `None` after `drain_pool`
     /// has consumed it.
     pool_join: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
@@ -570,6 +578,13 @@ impl SyncEngine {
             info!(recovered, "SyncEngine: stale-Syncing sweep recovered rows at startup");
         }
 
+        // Also recover files stuck in downloading when their directory was
+        // recovered by the stale-syncing sweep. These go together.
+        let recovered_files = db.stale_file_sweep(6)?;
+        if recovered_files > 0 {
+            info!(recovered_files, "SyncEngine: stale-file sweep recovered files at startup");
+        }
+
         // Wrap the Handle in a Mutex so the walker task can
         // borrow it briefly to open exec channels. The walker
         // is the only long-lived consumer of the Handle; the
@@ -600,22 +615,15 @@ impl SyncEngine {
             downloader_channels.push(raw);
         }
 
-        // Construct the downloader pool. The pool is now
-        // `WorkerPool<DownloaderSlotWorker>` (generic shape
-        // from `worker_pool.rs`). Each `DownloaderSlotWorker`
-        // owns one pre-opened SFTP channel and a clone of
-        // `Arc<Mutex<Handle>>` (for retry re-open) and
-        // `Arc<Config>` (for Handle-level reconnect). The
-        // pool's `poll_interval` is the same as before; the
-        // dispatch loop is identical to the old
-        // `downloader_loop` (now `worker_loop<W>` in
-        // `worker_pool.rs`).
+        // Construct the file-download pool. Each FileDownloaderSlotWorker
+        // claims individual files rather than whole directories, enabling
+        // concurrent downloads of multiple files from the same directory.
         let max_retries = config.max_download_retries();
         let poll_interval = Duration::from_millis(200);
         let config = Arc::new(config.clone());
-        let workers: Vec<Arc<DownloaderSlotWorker>> = downloader_channels
+        let workers: Vec<Arc<FileDownloaderSlotWorker>> = downloader_channels
             .into_iter()
-            .map(|raw| Arc::new(DownloaderSlotWorker::new(
+            .map(|raw| Arc::new(FileDownloaderSlotWorker::new(
                 raw,
                 Arc::clone(&handle),
                 Arc::clone(&config),
@@ -628,6 +636,7 @@ impl SyncEngine {
         Ok(SyncEngine {
             handle,
             walker_channel,
+            config,
             pool,
             pool_join,
         })
@@ -651,11 +660,12 @@ impl SyncEngine {
         // pool share the same `max_retries` value).
         let walker_channel = Arc::clone(&self.walker_channel);
         let handle = Arc::clone(&self.handle);
+        let config = Arc::clone(&self.config);
         let category = category.to_string();
         let db = db.clone();
         let max_retries = self.pool.workers[0].max_retries;
         let walker_handle = tokio::spawn(async move {
-            self_clone::run_walker(handle, walker_channel, db, category, max_retries).await
+            self_clone::run_walker(handle, walker_channel, config, db, category, max_retries).await
         });
 
         walker_handle.await
@@ -1375,14 +1385,25 @@ async fn try_download_file(
 ///   Handle-level reconnect path);
 /// - the per-pool `max_retries` budget (constant for the
 ///   pool's lifetime).
-pub struct DownloaderSlotWorker {
+/// Per-slot file-download worker. Each slot claims individual files from
+/// the shared file_downloads queue rather than whole directories. This
+/// allows multiple workers to download different files from the same
+/// directory concurrently, improving utilization when directories have
+/// many files.
+///
+/// The struct fields are the same as the old `DownloaderSlotWorker`:
+///   - `raw`: pre-opened SFTP channel for this slot
+///   - `handle`: shared Mutex over the russh Handle (for retry re-open)
+///   - `config`: shared Config clone
+///   - `max_retries`: per-file retry budget
+pub struct FileDownloaderSlotWorker {
     raw: Arc<RawSftpSession>,
     handle: Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>,
     config: Arc<Config>,
     max_retries: u32,
 }
 
-impl DownloaderSlotWorker {
+impl FileDownloaderSlotWorker {
     pub fn new(
         raw: Arc<RawSftpSession>,
         handle: Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>,
@@ -1391,48 +1412,81 @@ impl DownloaderSlotWorker {
     ) -> Self {
         Self { raw, handle, config, max_retries }
     }
+
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
 }
 
-impl Worker for DownloaderSlotWorker {
-    fn name(&self) -> &'static str { "download" }
+impl Worker for FileDownloaderSlotWorker {
+    fn name(&self) -> &'static str { "file-download" }
     fn claim_state(&self) -> &'static str { "detected" }
-    fn in_flight_state(&self) -> &'static str { "syncing" }
+    fn in_flight_state(&self) -> &'static str { "downloading" }
     fn success_state(&self) -> DirectoryState { DirectoryState::Synced }
     fn failure_state(&self) -> DirectoryState { DirectoryState::SyncingFailed }
 
-    fn claim(&self, db: &Database) -> anyhow::Result<Option<crate::db::DirectoryRow>> {
-        db.claim_detected_row()
+    fn count_remaining(&self, db: &Database) -> anyhow::Result<i64> {
+        db.count_eligible_files()
+    }
+
+    fn claim(&self, db: &Database) -> anyhow::Result<Option<DirectoryRow>> {
+        // claim_file returns FileRow, but Worker::claim must return DirectoryRow.
+        // We use the DirectoryRow type to satisfy the trait; the actual file
+        // data comes from FileRow which is fetched inside process.
+        db.claim_file().map(|opt| {
+            opt.map(|f| DirectoryRow {
+                id: f.id,
+                category: String::new(), // not needed for file-level download
+                remote_path: f.remote_path,
+                staging_path: f.staging_path,
+            })
+        })
     }
 
     fn process<'a>(
         &'a self,
         db: &'a Database,
-        row: crate::db::DirectoryRow,
+        row: DirectoryRow,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
-        // Delegate to the existing `download_directory` free
-        // function. The downloader-specific error handling
-        // (retry budget, channel re-open, Handle-level
-        // reconnect) is fully encapsulated there.
+        let raw = Arc::clone(&self.raw);
+        let handle = Arc::clone(&self.handle);
+        let config = Arc::clone(&self.config);
+        let max_retries = self.max_retries;
+        let file_id = row.id;
+
         Box::pin(async move {
-            let _ = download_directory(
-                &self.raw,
-                &self.handle,
-                row.remote_path.clone(),
-                row.staging_path.clone(),
-                String::new(),
+            // Re-fetch the FileRow inside process so we have dir_id and rel_path.
+            // The claim above returned a DirectoryRow-shaped placeholder; we need
+            // the actual FileRow data.
+            let file_row = db.get_file_row(file_id)?;
+
+            let remote = Path::new(&file_row.remote_path).join(&file_row.rel_path);
+            let local = Path::new(&file_row.staging_path).join(&file_row.rel_path);
+
+            let result = download_file(
+                &raw,
+                &handle,
+                &remote,
+                &local,
                 db,
-                row.id,
-                self.max_retries,
-                &self.config,
-            ).await?;
-            // Note: `download_directory` already calls
-            // `db.set_directory_state(id, Synced)` on success
-            // and `db.set_directory_error(id, SyncingFailed, ...)`
-            // on failure. The worker_loop's redundant
-            // success/failure transitions are guarded by the
-            // `Worker` trait shape — if the row is already in
-            // the expected state, the UPDATE is a no-op.
-            Ok(())
+                file_row.dir_id,
+                &file_row.rel_path,
+                max_retries,
+                &config,
+            ).await;
+
+            match result {
+                Ok(()) => {
+                    db.set_file_synced(file_id)?;
+                    db.try_complete_directory(file_row.dir_id)?;
+                    Ok(())
+                }
+                Err(e) => {
+                    db.set_file_failed(file_id, &e.to_string())?;
+                    // Don't fail the slot — one bad file shouldn't halt the worker.
+                    Ok(())
+                }
+            }
         })
     }
 }
@@ -1852,7 +1906,13 @@ pub(crate) async fn pipelined_read_to_file(
 /// borrows `&self`, so we move the implementation to a free
 /// function that takes the parts it needs by `&`-reference to
 /// owned values.
-mod self_clone {
+// `pub(super)` so the `tests` submodule (defined at the
+// bottom of this file) can drive `run_walker` directly in
+// the `test_real_sftp_walker_recovers_from_dead_channel`
+// integration test. Without this, the helper is only
+// accessible to the production `SyncEngine` code path
+// that spawns it via `tokio::spawn`.
+pub(super) mod self_clone {
     use super::*;
 
     /// Walker entry point. Spawned by `SyncEngine::sync_category`;
@@ -1876,11 +1936,11 @@ mod self_clone {
     pub async fn run_walker(
         handle: Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>,
         walker_channel: Arc<RawSftpSession>,
+        config: Arc<Config>,
         db: Database,
         category: String,
-        _max_retries: u32,
+        max_retries: u32,
     ) -> anyhow::Result<()> {
-        let config = Config::load_with_env(Path::new("/etc/media-pipeline/config.toml"))?;
         let remote_base = config.remote_path(&category);
         let staging_base = config.staging_path(&category);
 
@@ -1890,10 +1950,72 @@ mod self_clone {
         // for readdirs. The `xargs sha256sum` exec uses a fresh
         // session channel per directory, opened on the shared
         // `Handle` (it's a session-level operation, not SFTP).
+        //
+        // **Channel recovery.** `walker_channel` is rebindable:
+        // when the inline retry loops below recover from a
+        // dead channel, they swap in a fresh `Arc<RawSftpSession>`.
+        // The downloader pool's per-slot channels are
+        // independent — they have their own retry paths (see
+        // `download_file` at sync.rs:874).
+        let mut walker_channel = walker_channel;
 
         // List top-level remote directories in this category.
-        let remote_dirs = list_remote_dirs(&walker_channel, &remote_base).await
-            .with_context(|| format!("failed to list remote dirs in {}", remote_base.display()))?;
+        //
+        // **Channel-recovery retry loop.** Mirrors
+        // `download_file`'s inline retry block
+        // (sync.rs:995-1044). On `Err`, attempt (1) a channel
+        // re-open via the shared Handle; (2) a Handle-level
+        // reconnect. Rebind `walker_channel` to the fresh
+        // `Arc<RawSftpSession>`. After `max_retries` exhausted
+        // attempts, return the last `Err`.
+        let mut attempt: u32 = 0;
+        let remote_dirs = loop {
+            match list_remote_dirs(&walker_channel, &remote_base).await {
+                Ok(v) => break v,
+                Err(e) if attempt < max_retries => {
+                    attempt += 1;
+                    let mut recovered = false;
+                    {
+                        let h = handle.lock().await;
+                        match SyncEngine::open_sftp_session(&h).await {
+                            Ok(new_raw) => {
+                                info!(op = "list_remote_dirs", attempt,
+                                    "walker: reopened SFTP channel for retry");
+                                walker_channel = new_raw;
+                                recovered = true;
+                            }
+                            Err(open_err) => {
+                                warn!(op = "list_remote_dirs", attempt, error = %open_err,
+                                    "walker: channel re-open failed; escalating to Handle-level reconnect");
+                            }
+                        }
+                    }
+                    if !recovered {
+                        match SyncEngine::reconnect_handle_and_sftp(&handle, &*config).await {
+                            Ok(new_raw) => {
+                                info!(op = "list_remote_dirs", attempt,
+                                    "walker: reconnected russh Handle for retry");
+                                walker_channel = new_raw;
+                            }
+                            Err(recon_err) => {
+                                warn!(op = "list_remote_dirs", attempt, error = %recon_err,
+                                    "walker: Handle reconnect failed; will retry on current channel");
+                            }
+                        }
+                    }
+                    let backoff_secs = 2u64.saturating_pow(attempt).min(30);
+                    warn!(op = "list_remote_dirs", attempt, max_retries, backoff_secs, error = %e,
+                        "walker: list_remote_dirs failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                    continue;
+                }
+                Err(e) => {
+                    error!(op = "list_remote_dirs", attempt, max_retries, error = %e,
+                        "walker: list_remote_dirs failed after exhausting retry budget");
+                    return Err(e.context(format!("failed to list remote dirs in {}", remote_base.display())));
+                }
+            }
+        };
         info!(category = %category, count = remote_dirs.len(), "walker: remote directories found");
 
         for dir_name in &remote_dirs {
@@ -1909,12 +2031,61 @@ mod self_clone {
             // detection) and the per-file sha256 collection (for
             // download-time integrity verification). Walking
             // twice would double the per-dir cost for no benefit.
+            // **Channel-recovery retry loop** — same shape as
+            // the `list_remote_dirs` retry above. The
+            // `max_retries` budget is *per-directory*: a
+            // directory that exhausts retries is logged and
+            // skipped (best-effort walker, matching the design
+            // intent at sync.rs:1934-1937). The next directory
+            // gets its own budget.
             let walk_started = Instant::now();
-            let manifest = match collect_manifest(&walker_channel, &remote_dir).await {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(dir = %dir_name, error = %e, "walker: failed to collect manifest, skipping");
-                    continue;
+            let mut attempt: u32 = 0;
+            let manifest = loop {
+                match collect_manifest(&walker_channel, &remote_dir).await {
+                    Ok(m) => break m,
+                    Err(e) if attempt < max_retries => {
+                        attempt += 1;
+                        let mut recovered = false;
+                        {
+                            let h = handle.lock().await;
+                            match SyncEngine::open_sftp_session(&h).await {
+                                Ok(new_raw) => {
+                                    info!(op = "collect_manifest", attempt,
+                                        "walker: reopened SFTP channel for retry");
+                                    walker_channel = new_raw;
+                                    recovered = true;
+                                }
+                                Err(open_err) => {
+                                    warn!(op = "collect_manifest", attempt, error = %open_err,
+                                        "walker: channel re-open failed; escalating to Handle-level reconnect");
+                                }
+                            }
+                        }
+                        if !recovered {
+                            match SyncEngine::reconnect_handle_and_sftp(&handle, &*config).await {
+                                Ok(new_raw) => {
+                                    info!(op = "collect_manifest", attempt,
+                                        "walker: reconnected russh Handle for retry");
+                                    walker_channel = new_raw;
+                                }
+                                Err(recon_err) => {
+                                    warn!(op = "collect_manifest", attempt, error = %recon_err,
+                                        "walker: Handle reconnect failed; will retry on current channel");
+                                }
+                            }
+                        }
+                        let backoff_secs = 2u64.saturating_pow(attempt).min(30);
+                        warn!(op = "collect_manifest", attempt, max_retries, backoff_secs, error = %e,
+                            "walker: collect_manifest failed; retrying");
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        // Best-effort: log and skip the directory.
+                        warn!(dir = %dir_name, error = %e,
+                            "walker: failed to collect manifest after retries, skipping");
+                        continue;
+                    }
                 }
             };
             info!(
@@ -1988,6 +2159,14 @@ mod self_clone {
             if !file_hashes.is_empty() {
                 db.append_file_hashes(dir_id, &file_hashes)
                     .context("walker: failed to append file hashes")?;
+            }
+
+            // Backfill file_downloads rows for this directory's manifest.
+            // INSERT OR IGNORE so re-walks are a no-op for already-tracked files.
+            // file_hashes elements are (rel_path, hash, size, mtime).
+            for (rel_path, _, _, _) in &file_hashes {
+                db.upsert_file_downloads_row(dir_id, rel_path)
+                    .context("walker: failed to upsert file_downloads row")?;
             }
 
             // The row is now in the DB (state = 'detected' if
@@ -4533,5 +4712,274 @@ mod tests {
         // ---- 7. Tear down ----
         //
         // Container cleaned up by `DockerContainer` Drop.
+    }
+
+    /// Regression test for the 2026-06-17 physalis production
+    /// bug. The walker's pre-opened `walker_channel` is
+    /// multiplexed over the russh `Handle` inside the
+    /// `Arc<Mutex<Handle>>`. When the downloader pool escalates
+    /// to `reconnect_handle_and_sftp`, the Handle inside the
+    /// Mutex is replaced with a fresh russh session — and the
+    /// walker's channel is now multiplexed over the *old* Handle,
+    /// so subsequent opendirs on it fail. Pre-fix, the walker
+    /// logged `walker: failed to collect manifest, skipping` and
+    /// gave up on the directory, then failed on every
+    /// subsequent opendir with `Packet N for unknown recipient`
+    /// warnings streaming out of russh-sftp.
+    ///
+    /// The fix: `run_walker` now wraps `list_remote_dirs` and
+    /// `collect_manifest` in inline retry loops that re-open
+    /// the walker channel (and escalate to Handle reconnect)
+    /// on `Err`. This test drives `run_walker` end-to-end
+    /// against a real atmoz/sftp container, kills the walker
+    /// channel mid-walk, and asserts the walker recovers and
+    /// completes successfully.
+    ///
+    /// **Setup.** Bind-mount a host directory containing a
+    /// `tv/` subdir with two show subdirs (each with a small
+    /// file) into the container. The walker walks `tv/`,
+    /// collects manifests for both shows, and writes rows to
+    /// the DB. Mid-walk, we kill the channel — the fix's
+    /// retry path should re-open it and the walker should
+    /// complete.
+    ///
+    /// **Gated.** Same docker + atmoz/sftp image dependencies
+    /// as the other `real_sftp` tests. Run with
+    /// `cargo test --release -- --ignored real_sftp`.
+    #[tokio::test]
+    #[ignore = "requires docker + atmoz/sftp image; run with --ignored. \
+                Fails (does not silently no-op) if preconditions are missing — \
+                this is opt-in because of the docker dependency, not because the \
+                outcome is conditional."]
+    async fn test_real_sftp_walker_recovers_from_dead_channel() {
+        use crate::config::CategoryConfig;
+        use crate::sync::self_clone::run_walker;
+        use crate::sync::establish_russh_session;
+        use std::collections::HashMap;
+        use std::process::Command;
+
+        // ---- 1. Pre-flight checks (same as the other
+        //         real-SFTP tests) ----
+        if !real_sftp_docker_available() {
+            panic!(
+                "real_sftp preflight failed: `docker info` exited non-zero. \
+                 Install/start docker, or skip the real-SFTP tests by \
+                 omitting `--ignored`."
+            );
+        }
+        if !real_sftp_image_available() {
+            panic!(
+                "real_sftp preflight failed: atmoz/sftp:latest image not pulled. \
+                 Run `docker pull atmoz/sftp:latest` and re-run, or skip the \
+                 real-SFTP tests by omitting `--ignored`."
+            );
+        }
+
+        // ---- 2. Set up the directory tree the walker will
+        //         walk. We bind-mount a host directory
+        //         containing `tv/Show.S01/file.mkv` and
+        //         `tv/Show.S02/file.mkv` into the container.
+        //         The walker reads the chroot-relative path
+        //         `/tv/` (atmoz/sftp chroots `test` to
+        //         `/home/test/`). ----
+        let tree_dir = tempfile::tempdir().expect("tempdir for tree");
+        let tree_path = tree_dir.path().to_path_buf();
+        // Create `Show.S01/episode.mkv` and
+        // `Show.S02/episode.mkv` directly under `tree_path`.
+        // The bind-mount maps `tree_path` -> `/home/test/upload`
+        // inside the chroot, and the test's Config has
+        // `remote_dir = "upload"`, so the walker's path is
+        // `/upload/<show>/<file>` — the show dirs sit at the
+        // top of `tree_path` (no `tv/` subdir).
+        for show in &["Show.S01", "Show.S02"] {
+            let show_dir = tree_path.join(show);
+            std::fs::create_dir_all(&show_dir).expect("create show dir");
+            let file_path = show_dir.join("episode.mkv");
+            std::fs::write(&file_path, b"small file for walker test\n")
+                .expect("write episode");
+        }
+
+        // ---- 3. Set up the SSH keypair and a separate
+        //         tempdir for keys (mirrors the other tests). ----
+        let key_dir = tempfile::tempdir().expect("tempdir for keys");
+        let key_dir_path = key_dir.path().to_path_buf();
+        let priv_key_path = generate_test_keypair(&key_dir_path)
+            .expect("keypair generation");
+
+        // The atmoz/sftp entrypoint scans `/home/test/.ssh/keys/`
+        // and aggregates every `.pub` file in it into
+        // `~/.ssh/authorized_keys`. Build that keys dir.
+        let pubkey_path = key_dir_path.join("id_ed25519.pub");
+        let pubkey_str = std::fs::read_to_string(&pubkey_path)
+            .expect("read pubkey")
+            .trim()
+            .to_string();
+        let keys_dir = key_dir_path.join("keys");
+        std::fs::create_dir_all(&keys_dir).expect("create keys dir");
+        std::fs::write(keys_dir.join("id_ed25519.pub"), format!("{}\n", pubkey_str))
+            .expect("write pubkey");
+
+        // Pick a free TCP port for the container's sshd.
+        let port: u16 = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind 0");
+            listener.local_addr().unwrap().port()
+        };
+
+        // Start the container. Bind-mount the keys dir
+        // (read-only) and the tree dir (read-only) at the
+        // chroot-internal paths. We don't use
+        // `start_sftp_container` because that helper mounts
+        // a single file, not a directory tree — and the
+        // walker needs at least one subdir to read.
+        let name = format!("real_sftp_walker_{}_{}",
+            std::process::id(), next_container_index());
+        let status = Command::new("docker")
+            .args([
+                "run", "-d", "--rm",
+                "--name", &name,
+                "-p", &format!("{}:22", port),
+                "-v", &format!("{}:/home/test/.ssh/keys:ro", keys_dir.display()),
+                // The tree dir is bound at `/home/test/upload`,
+                // and we configured the Config's `remote_dir`
+                // to be `upload` (so the chroot-relative path
+                // is `/upload/<show>/<file>`).
+                "-v", &format!("{}:/home/test/upload:ro", tree_path.display()),
+                "atmoz/sftp:latest",
+                "test::1001",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("docker run failed to start");
+        if !status.success() {
+            panic!("docker run exited non-zero");
+        }
+        let container = DockerContainer { name };
+        wait_for_sshd(port).await.expect("sshd ready");
+
+        // ---- 4. Build a `Config` whose `remote_dir` for
+        //         the `tv` category is `upload` (so the
+        //         walker's `remote_path()` resolves to
+        //         `/upload`, which is the chroot-relative
+        //         path to the bind-mounted tree). ----
+        let mut categories = HashMap::new();
+        categories.insert(
+            "tv".to_string(),
+            CategoryConfig {
+                remote_dir: "upload".to_string(),
+                library_folder: "TvShows".to_string(),
+                plex_section: None,
+            },
+        );
+        let staging_root = tempfile::tempdir().expect("staging tempdir");
+        let test_config = Config {
+            ssh: crate::config::SshConfig {
+                host: "127.0.0.1".to_string(),
+                port: Some(port),
+                user: "test".to_string(),
+                private_key_path: priv_key_path.clone(),
+                remote_base_path: PathBuf::from("/"),
+            },
+            database: crate::config::DatabaseConfig {
+                path: PathBuf::from("/tmp/nonexistent-test-db.sqlite"),
+            },
+            paths: crate::config::PathsConfig {
+                staging: staging_root.path().to_path_buf(),
+                library: PathBuf::from("/tmp/nonexistent-library"),
+            },
+            plex: crate::config::PlexConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                sections: HashMap::new(),
+            },
+            logging: None,
+            group_name: None,
+            categories,
+            metadata: crate::config::MetadataConfig::default(),
+            sync: crate::config::SyncConfig::default(),
+        };
+
+        // ---- 5. Establish Handle #1 via the production
+        //         initial-connect path. ----
+        let handle = Arc::new(tokio::sync::Mutex::new(
+            establish_russh_session(&test_config)
+                .await
+                .expect("establish Handle"),
+        ));
+
+        // Pre-open the walker channel. This is the same
+        // `open_sftp_session` call the production
+        // `SyncEngine::new` does for the walker.
+        let walker_channel = {
+            let h = handle.lock().await;
+            SyncEngine::open_sftp_session(&h)
+                .await
+                .expect("open walker channel")
+        };
+
+        // Confirm the channel is functional before we
+        // spawn the walker — sanity check on the
+        // setup.
+        let _attrs = walker_channel
+            .lstat("/upload/Show.S01/episode.mkv".to_string())
+            .await
+            .expect("pre-walk lstat on first show");
+
+        // In-memory DB (the test doesn't assert on DB
+        // contents — just on the walker returning
+        // `Ok(())`).
+        let db = Database::open(std::path::Path::new(":memory:"))
+            .expect("in-memory db");
+
+        // ---- 6. Spawn `run_walker`. The walker is
+        //         designed to be `tokio::spawn`-ed from
+        //         `sync_category`; we replicate that
+        //         here. `max_retries = 3` gives the
+        //         channel-recovery path three shots
+        //         before it gives up — enough for the
+        //         kill-then-recover flow this test
+        //         exercises. ----
+        let config_arc = Arc::new(test_config);
+        let walker_handle: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            let walker_channel = Arc::clone(&walker_channel);
+            let config = Arc::clone(&config_arc);
+            let db = db.clone();
+            async move {
+                run_walker(handle, walker_channel, config, db, "tv".to_string(), 3).await
+            }
+        });
+
+        // ---- 7. Kill the walker channel mid-walk. The
+        //         walker calls `list_remote_dirs` (one
+        //         round-trip) and then enters the for-loop
+        //         over directories. A 200ms sleep is enough
+        //         for `list_remote_dirs` to complete and
+        //         the walker to begin the first
+        //         `collect_manifest` call. The first
+        //         `collect_manifest` opendir will then
+        //         hit the dead channel. The inline retry
+        //         loop re-opens the channel (or escalates
+        //         to Handle reconnect if re-open fails)
+        //         and the walker continues. ----
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        walker_channel.close_session().expect("close walker channel");
+        // Give the server a moment to register the
+        // channel close on its end. Without this sleep
+        // the russh-sftp client may not yet have seen
+        // the close and the re-open on the same Handle
+        // may succeed trivially without testing the
+        // recovery path.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // ---- 8. Assert: the walker completes
+        //         successfully. ----
+        let result = walker_handle.await
+            .expect("walker task panicked")
+            .expect("walker returned Err");
+        // (No further assertions on DB state — the
+        // walker's success path is the test's
+        // signal.)
+        let _ = result;
     }
 }

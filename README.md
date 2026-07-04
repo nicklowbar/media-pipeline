@@ -2,16 +2,17 @@
 
 Automated media sync, rename, and ingest pipeline.
 
-Downloads media from a remote host via SSH/SFTP, renames files to a consistent format, and moves the result into a Plex/Jellyfin library. Library-side re-encoding (x264 → HEVC, target resolution ladder, format normalization) is handled by [Tdarr](https://home.tdarr.info/) — see `memory/architecture-pipeline-vs-tdarr.md` in the project vault for the split rationale.
+Downloads media from a remote host via SSH/SFTP, renames files to a consistent format, and moves the result into a Plex/Jellyfin library. Library-side re-encoding (x264 → HEVC, target resolution ladder, format normalization) is handled by [Tdarr](https://home.tdarr.info/) — see `TechnicalNotes/Projects/MediaPipeline/` in the Obsidian vault for the split rationale.
 
 ## Features
 
 - **SSH/SFTP sync** with manifest-based change detection (no more brittle rsync exclude lists)
-- **Per-title auto-detection** of transcode needs via `ffprobe`
+- **Per-file concurrent downloads** — multiple files from the same directory can download simultaneously; a stalled file no longer blocks other files in the same directory
+- **SQLite-backed two-tier state machine** — directory-level states (`detected → in_library`) with a per-file `file_downloads` table (`detected → downloading → synced | failed`) underneath
 - **Configurable release group renaming** (replaces original uploader group names)
-- **Atomic operations** throughout: temp files during transcode, atomic moves into the library
-- **SQLite-backed state machine** tracks every title from `detected` → `in_library`
+- **Atomic operations** throughout: temp files during rename, atomic moves into the library
 - **Plex library scan trigger** after ingest
+- **Daemon mode** — runs continuously with a configurable sleep interval between syncs
 - **Docker-ready** with multi-stage build
 
 ## Architecture
@@ -23,9 +24,10 @@ Remote host (downloads)
     ▼
 Docker container (or local)
     ├── Staging volume
-    ├── ffprobe analysis → DetectedPolicy
-    ├── Rename files (group replacement + codec tag update)
-    └── Atomic move to library mount
+    ├── Walk: collect per-file manifests, claim files
+    ├── Download: 4 concurrent file slots, per-file SHA-256 verification
+    ├── Rename files (group replacement + codec tag update)  [disabled]
+    └── Atomic move to library mount                          [disabled]
     │
     ▼
 Library storage (TrueNAS / NAS / local)
@@ -35,6 +37,8 @@ Library storage (TrueNAS / NAS / local)
     └── ...
 ```
 
+Rename and move pools are disabled pending a CIFS permission fix (container runs as `uid=1000/gid=1111` on physalis). Files land in staging after download; a separate move step is required to get them into the library. See `pipeline.rs` module docs for the re-enablement path.
+
 The transcode step is deliberately omitted — Tdarr owns library-side re-encoding. See "Library stewardship" below.
 
 ## Quick Start
@@ -42,7 +46,6 @@ The transcode step is deliberately omitted — Tdarr owns library-side re-encodi
 ### 1. Build
 
 ```bash
-cd media-pipeline
 cargo build --release
 ```
 
@@ -73,44 +76,36 @@ Key settings:
 ### 3. Run
 
 ```bash
-# Full pipeline: sync → analyze → rename → transcode → move → plex scan
+# One-shot: sync all categories once and exit
 ./target/release/media-pipeline run --config config/media-pipeline.toml
 
-# Or individual phases
-./target/release/media-pipeline sync-only --config config/media-pipeline.toml
-./target/release/media-pipeline process-only --config config/media-pipeline.toml
+# Daemon mode: run continuously, sleeping 12h between syncs
+./target/release/media-pipeline run --interval 12h --config config/media-pipeline.toml
 
 # Check pipeline status
 ./target/release/media-pipeline status --config config/media-pipeline.toml
 ```
 
-### 4. Docker (recommended for transcoding workloads)
+### 4. Docker
 
 ```bash
 docker run --rm \
   -v /mnt/mediaserver:/library \
-  -v /opt/media-pipeline/staging:/staging \
+  -v /mnt/mediaserver/Staging:/staging \
   -v /opt/media-pipeline/config:/etc/media-pipeline:ro \
-  -v /opt/media-pipeline/ssh:/root/.ssh:ro \
+  -v /opt/media-pipeline/ssh:/ssh:ro \
   -v /opt/media-pipeline/data:/data \
   -e MEDIA_PIPELINE_PLEX_TOKEN=your-token-here \
-  media-pipeline:latest
+  media-pipeline:latest run --interval 12h
 ```
 
-## Detected Policies
-
-After syncing, each title is analyzed to determine the appropriate post-processing:
-
-| Policy | Trigger | Action |
-|--------|---------|--------|
-| `none` | Already HEVC/x265 or no video files | Skip transcoding |
-| `x264_to_x265` | Source is H.264 | Re-encode to x265 (HEVC), AAC audio, copy subtitles |
-| `downscale_1080p` | Source is 4K/H.264 (if enabled) | Re-encode to 1080p x265 with lanczos scaling |
-| `manual` | Unrecognizable format (DVD ISO, etc.) | Skip; requires manual intervention |
-
-Policies are detected per-title, not per-category.
+Note: the container must run with the CIFS mount's gid (typically `1111`) as a secondary group, e.g. `--user 1000:1111`, so that files written to the TrueNAS share pass the mount's `forcegid` check.
 
 ## State Machine
+
+The pipeline tracks state at two levels:
+
+### Directory-level states
 
 Every top-level directory is tracked in SQLite:
 
@@ -119,15 +114,28 @@ detected → syncing → synced → analyzing → analyzed → renaming → rena
     → moving → in_library
 ```
 
-The `transcoding` and `transcoded` states are part of the schema for historical reasons but are no longer entered on a normal run — see "Library stewardship" below.
-
 Failed states are recoverable: if the remote manifest changes, the record resets to `detected` for reprocessing.
+
+### Per-file states (file_downloads table)
+
+Under the directory level, each file in a directory being downloaded has its own state machine:
+
+```
+detected → downloading → synced
+                       → failed (retryable; resets to detected on next walk)
+```
+
+The file-level state allows multiple files from the same directory to download concurrently. A stalled or failed file does not block other files in the same directory. When a directory's files are all `synced`, the directory transitions to `syncing_done` (internal) and then `synced`.
+
+### Stale file recovery
+
+At pipeline startup, a stale-file sweep recovers any files stuck in `downloading` state older than 6 hours — these are reset to `detected` so they can be re-claimed and re-downloaded.
 
 ## Library stewardship (Tdarr)
 
 This pipeline drops files into the library as-is. Re-encoding to a target spec (HEVC/x265, the 4K → 1080p → 720p → 480p quality ladder, support for x264 / AVI / DVD-ISO inputs) is handled by [Tdarr](https://home.tdarr.info/), which walks the library periodically and re-encodes anything that doesn't match its configured health check.
 
-Integration is filesystem-only: Tdarr watches the same `/library/` mount the pipeline writes to. No API coupling, no shared DB. The pipeline's `transcode` module and the `Transcoding`/`Transcoded` state variants are kept in the codebase for the rare case where a future operator wants to force-re-encode a batch, but they are not invoked by the normal `run` command.
+Integration is filesystem-only: Tdarr watches the same `/library/` mount the pipeline writes to. No API coupling, no shared DB.
 
 ## Testing
 
@@ -135,11 +143,11 @@ Integration is filesystem-only: Tdarr watches the same `/library/` mount the pip
 cargo test
 ```
 
-Tests cover config parsing, DB state transitions, rename regex logic, policy selection, library move semantics, and Plex URL construction.
+Tests cover config parsing, DB state transitions, rename regex logic, policy selection, library move semantics, Plex URL construction, and the file-download state machine.
 
 ## Requirements
 
-- Rust 1.78+ (for building from source)
+- Rust 1.78+
 - `ffprobe` (runtime, for ffprobe analysis)
 - SSH private key for remote host access
 - Plex token (optional, for library scan triggers)

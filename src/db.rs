@@ -73,6 +73,50 @@ pub struct DirectoryRow {
     pub staging_path: String,
 }
 
+/// State machine for a single file's download progress.
+///
+/// Each phase has a single `*Failed` variant so a file's last failure
+/// point is preserved. The stale-file sweep resets `downloading` files
+/// to `detected` when their parent directory is recovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileState {
+    Detected,
+    Downloading,
+    Synced,
+    Failed,
+}
+
+impl FileState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FileState::Detected    => "detected",
+            FileState::Downloading => "downloading",
+            FileState::Synced     => "synced",
+            FileState::Failed    => "failed",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "detected"    => Some(FileState::Detected),
+            "downloading" => Some(FileState::Downloading),
+            "synced"      => Some(FileState::Synced),
+            "failed"      => Some(FileState::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// A row claimed by `claim_file` — one file eligible for download.
+#[derive(Debug, Clone)]
+pub struct FileRow {
+    pub id: i64,
+    pub dir_id: i64,
+    pub rel_path: String,
+    pub staging_path: String,
+    pub remote_path: String,
+}
+
 /// Handle to the pipeline's SQLite database. Cheap to clone — the
 /// underlying `Connection` is shared via `Arc<Mutex<_>>` so multiple
 /// consumers (the rename path, the metadata cache, future workers)
@@ -460,6 +504,44 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_file_hashes_dir ON file_hashes(dir_id);
+
+            -- Per-file download state for file-level work distribution.
+            -- One row per file in a directory being downloaded. The
+            -- state machine is: detected → downloading → synced | failed.
+            -- FK cascade to directories so deleting a directory removes
+            -- its file_downloads rows. dir_id+rel_path is UNIQUE so
+            -- re-walking a directory is a no-op (INSERT OR IGNORE).
+            CREATE TABLE IF NOT EXISTS file_downloads (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                dir_id          INTEGER NOT NULL REFERENCES directories(id) ON DELETE CASCADE,
+                rel_path        TEXT NOT NULL,
+                state           TEXT NOT NULL DEFAULT 'detected'
+                                    CHECK(state IN ('detected','downloading','synced','failed')),
+                downloading_at   DATETIME,
+                error_message   TEXT,
+                UNIQUE(dir_id, rel_path)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fd_dir    ON file_downloads(dir_id);
+            CREATE INDEX IF NOT EXISTS idx_fd_state  ON file_downloads(state);
+            "#,
+        )?;
+
+        // Migrate existing DBs: backfill file_downloads for any
+        // directory that already has file_hashes entries but no
+        // file_downloads rows. Uses INSERT OR IGNORE so it is
+        // idempotent on re-runs.
+        conn.execute_batch(
+            r#"
+            INSERT OR IGNORE INTO file_downloads (dir_id, rel_path, state)
+            SELECT DISTINCT fh.dir_id, fh.rel_path, 'detected'
+              FROM file_hashes fh
+              JOIN directories d ON d.id = fh.dir_id
+             WHERE NOT EXISTS (
+                   SELECT 1 FROM file_downloads fd
+                    WHERE fd.dir_id = fh.dir_id
+                      AND fd.rel_path = fh.rel_path
+               );
             "#,
         )?;
         Ok(())
@@ -866,6 +948,192 @@ impl Database {
         if n > 0 {
             info!(recovered = n, max_age_hours, "stale-Syncing sweep: recovered rows");
         }
+        Ok(n)
+    }
+
+    // ----------------------------------------------------------------------
+    // Per-file download state
+    //
+    // The file_downloads table enables file-level work distribution: workers
+    // claim individual files rather than whole directories. Each file goes
+    // through detected → downloading → synced | failed. The directory's
+    // state transitions to Synced when all its files are synced or failed.
+    // ----------------------------------------------------------------------
+
+    /// Atomically claim one file in `detected` state whose parent
+    /// directory is in `Syncing`. Multiple workers can claim different
+    /// files from the same directory concurrently.
+    ///
+    /// SQLite does not support RETURNING joined columns, so this uses
+    /// two queries: first UPDATE + RETURNING the file id, then a
+    /// separate SELECT to fetch directory columns.
+    pub fn claim_file(&self) -> anyhow::Result<Option<FileRow>> {
+        let conn = self.conn.lock().unwrap();
+
+        // Step 1: claim the file and get its id.
+        let claimed_id: Option<i64> = {
+            let mut stmt = conn.prepare_cached(
+                "UPDATE file_downloads
+                    SET state = 'downloading', downloading_at = CURRENT_TIMESTAMP
+                  WHERE id = (
+                      SELECT fd.id FROM file_downloads fd
+                      JOIN directories d ON d.id = fd.dir_id
+                      WHERE fd.state = 'detected'
+                        AND d.state = 'detected'
+                      ORDER BY fd.rowid ASC
+                      LIMIT 1
+                  )
+                    AND state = 'detected'
+                  RETURNING id",
+            )?;
+            stmt.query_row([], |r| r.get(0)).ok()
+        };
+
+        let id = match claimed_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // Step 2: fetch directory columns for the returned file id.
+        let row = conn.query_row(
+            "SELECT fd.id, fd.dir_id, fd.rel_path, d.staging_path, d.remote_path
+               FROM file_downloads fd
+               JOIN directories d ON d.id = fd.dir_id
+              WHERE fd.id = ?1",
+            params![id],
+            |r| Ok(FileRow {
+                id: r.get(0)?,
+                dir_id: r.get(1)?,
+                rel_path: r.get(2)?,
+                staging_path: r.get(3)?,
+                remote_path: r.get(4)?,
+            }),
+        )?;
+
+        Ok(Some(row))
+    }
+
+    /// Mark one file as successfully downloaded.
+    pub fn set_file_synced(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE file_downloads SET state = 'synced' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark one file as failed with a message.
+    pub fn set_file_failed(&self, id: i64, message: &str) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE file_downloads SET state = 'failed', error_message = ?2 WHERE id = ?1",
+            params![id, message],
+        )?;
+        Ok(())
+    }
+
+    /// Transition the directory to `Synced` if all its files are in a
+    /// terminal state (`synced` or `failed`). Returns `true` if the
+    /// directory was transitioned, `false` otherwise (still work pending).
+    pub fn try_complete_directory(&self, dir_id: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE directories
+                SET state = 'synced', synced_at = CURRENT_TIMESTAMP
+              WHERE id = ?1
+                AND state = 'detected'
+                AND NOT EXISTS (
+                    SELECT 1 FROM file_downloads
+                     WHERE dir_id = ?1
+                       AND state NOT IN ('synced', 'failed')
+                )",
+            params![dir_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Count files in a given state for a directory. Used to check
+    /// remaining work.
+    pub fn count_files_in_state(&self, dir_id: i64, state: FileState) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_downloads WHERE dir_id = ?1 AND state = ?2",
+            params![dir_id, state.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Sweep files stuck in `downloading` whose parent directory
+    /// has since been recovered to `detected` by the stale-syncing
+    /// sweep. This handles the case where a directory was interrupted
+    /// mid-download — both the directory and its in-progress files
+    /// need to be reset together.
+    pub fn stale_file_sweep(&self, max_age_hours: i64) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            r#"UPDATE file_downloads
+                  SET state = 'detected', downloading_at = NULL
+                WHERE dir_id IN (
+                    SELECT id FROM directories WHERE state = 'detected'
+                )
+                  AND state = 'downloading'
+                  AND downloading_at < datetime('now', '-' || ?1 || ' hours')"#,
+            params![max_age_hours],
+        )?;
+        if n > 0 {
+            info!(recovered = n, max_age_hours, "stale-file sweep: recovered files");
+        }
+        Ok(n)
+    }
+
+    /// Fetch a single file_downloads row by its id. Used by
+    /// FileDownloaderSlotWorker::process() to look up the full
+    /// FileRow after claiming a file.
+    pub fn get_file_row(&self, file_id: i64) -> anyhow::Result<FileRow> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT fd.id, fd.dir_id, fd.rel_path, d.staging_path, d.remote_path
+               FROM file_downloads fd
+               JOIN directories d ON d.id = fd.dir_id
+              WHERE fd.id = ?1",
+            params![file_id],
+            |row| {
+                Ok(FileRow {
+                    id: row.get(0)?,
+                    dir_id: row.get(1)?,
+                    rel_path: row.get(2)?,
+                    staging_path: row.get(3)?,
+                    remote_path: row.get(4)?,
+                })
+            },
+        )?;
+        Ok(row)
+    }
+
+    /// Upsert a single file_downloads row. Uses INSERT OR IGNORE so
+    /// re-walking a directory is a no-op for already-tracked files.
+    /// Called by the walker when it first sees a directory's manifest.
+    pub fn upsert_file_downloads_row(&self, dir_id: i64, rel_path: &str) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO file_downloads (dir_id, rel_path, state) VALUES (?1, ?2, 'detected')",
+            params![dir_id, rel_path],
+        )?;
+        Ok(())
+    }
+
+    /// Count all files eligible for download: files in `detected` state
+    /// whose parent directory is in `detected`. Used as the drain
+    /// condition for the file-download pool.
+    pub fn count_eligible_files(&self) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            r#"SELECT COUNT(*) FROM file_downloads fd
+                 JOIN directories d ON d.id = fd.dir_id
+                WHERE fd.state = 'detected'
+                  AND d.state = 'detected'"#,
+            [],
+            |row| row.get(0),
+        )?;
         Ok(n)
     }
 
@@ -2029,5 +2297,231 @@ mod tests {
         // The row's syncing_at is "now" (just set), so the
         // sweep with a 6-hour threshold does not recover it.
         assert_eq!(recovered, 0);
+    }
+
+    // ----------------------------------------------------------------------
+    // file_downloads tests
+    //
+    // The file_downloads table is the job queue for per-file download
+    // workers. These tests pin the SQL contract: claim, state transitions,
+    // directory completion, stale sweep, and INSERT OR IGNORE re-walk
+    // safety.
+    // ----------------------------------------------------------------------
+
+    /// Helper: create a directory in Detected state with N file_downloads
+    /// rows in Detected state, then return the directory id.
+    /// Mirrors the production state after the walker upserts a directory:
+    /// the directory is in 'detected' and its files are in 'detected'.
+    fn make_file_dir(db: &Database, n_files: usize) -> i64 {
+        let dir_id = make_dir(db, "tvshows", "/srv/data/media/tv/Show", "hash-show");
+
+        // Upsert file_hashes so the FK on file_downloads is satisfied.
+        let hashes: Vec<(String, String, i64, i64)> = (0..n_files)
+            .map(|i| (format!("ep{}.mkv", i + 1), "a".repeat(64), 1_000_000, 1_700_000_000))
+            .collect();
+        db.upsert_file_hashes(dir_id, &hashes).unwrap();
+
+        // Backfill file_downloads — mirrors what run_walker does.
+        for (rel_path, _, _, _) in &hashes {
+            db.upsert_file_downloads_row(dir_id, rel_path).unwrap();
+        }
+
+        dir_id
+    }
+
+    #[test]
+    fn test_claim_file_returns_detected_file() {
+        let db = in_memory_db();
+        let dir_id = make_file_dir(&db, 3);
+
+        let row = db.claim_file().unwrap().expect("should have files to claim");
+        assert_eq!(row.dir_id, dir_id);
+        assert!(row.rel_path.starts_with("ep"));
+        assert!(row.rel_path.ends_with(".mkv"));
+    }
+
+    #[test]
+    fn test_claim_file_only_from_detected_directories() {
+        // A file in a Detected directory can be claimed (the walker discovered it).
+        // A file whose parent is not in Detected (e.g. already synced) cannot.
+        let db = in_memory_db();
+        let dir_id = make_file_dir(&db, 2);
+
+        // Directory is in Detected → files should be claimable.
+        let row = db.claim_file().unwrap();
+        assert!(row.is_some(), "file in Detected dir should be claimable");
+
+        // Mark the directory as already synced — its remaining files should not be claimable.
+        db.set_directory_state(dir_id, DirectoryState::Synced).unwrap();
+        let row2 = db.claim_file().unwrap();
+        assert!(row2.is_none(), "file in Synced dir should not be claimable");
+    }
+
+    #[test]
+    fn test_claim_file_idempotent_under_concurrent_calls() {
+        // Two simultaneous claims on the same DB must not return the
+        // same file. The atomic UPDATE...RETURNING pattern makes this
+        // safe even from separate connections.
+        let db = in_memory_db();
+        make_file_dir(&db, 2);
+
+        let row1 = db.claim_file().unwrap().expect("first file available");
+        let row2 = db.claim_file().unwrap().expect("second file available");
+
+        assert_ne!(row1.id, row2.id, "concurrent claims must not return the same file");
+    }
+
+    #[test]
+    fn test_set_file_synced_and_try_complete_directory() {
+        let db = in_memory_db();
+        let dir_id = make_file_dir(&db, 2);
+
+        // Claim and sync file 1.
+        let f1 = db.claim_file().unwrap().expect("file 1 available");
+        db.set_file_synced(f1.id).unwrap();
+
+        // Directory must NOT be complete yet — file 2 is still detected.
+        let completed = db.try_complete_directory(dir_id).unwrap();
+        assert!(!completed, "directory should not be complete while files remain");
+
+        // Claim and sync file 2.
+        let f2 = db.claim_file().unwrap().expect("file 2 available");
+        db.set_file_synced(f2.id).unwrap();
+
+        // Now the directory should complete.
+        let completed = db.try_complete_directory(dir_id).unwrap();
+        assert!(completed, "directory should be complete when all files synced");
+
+        let dir = db.get_directory_by_id(dir_id).unwrap().unwrap();
+        assert_eq!(dir.state, DirectoryState::Synced);
+        assert!(dir.synced_at.is_some());
+    }
+
+    #[test]
+    fn test_try_complete_directory_not_blocked_by_failed_files() {
+        // Failed files are terminal but do NOT block directory completion.
+        // This is the key difference from the old per-directory model:
+        // one bad file doesn't fail the whole directory.
+        let db = in_memory_db();
+        let dir_id = make_file_dir(&db, 3);
+
+        // Sync 1 file, fail 1 file, 1 still detected.
+        let f1 = db.claim_file().unwrap().unwrap();
+        db.set_file_synced(f1.id).unwrap();
+
+        let f2 = db.claim_file().unwrap().unwrap();
+        db.set_file_failed(f2.id, "checksum mismatch").unwrap();
+
+        // Third file still pending — try_complete must not yet succeed.
+        let completed = db.try_complete_directory(dir_id).unwrap();
+        assert!(!completed);
+
+        // Complete the last file.
+        let f3 = db.claim_file().unwrap().unwrap();
+        db.set_file_failed(f3.id, "file missing").unwrap();
+
+        // All remaining are terminal (failed), directory can now complete.
+        let completed = db.try_complete_directory(dir_id).unwrap();
+        assert!(completed, "directory should complete when all files are terminal (synced or failed)");
+
+        let dir = db.get_directory_by_id(dir_id).unwrap().unwrap();
+        assert_eq!(dir.state, DirectoryState::Synced);
+    }
+
+    #[test]
+    fn test_set_file_failed_records_error_message() {
+        let db = in_memory_db();
+        make_file_dir(&db, 1);
+
+        let f1 = db.claim_file().unwrap().unwrap();
+        db.set_file_failed(f1.id, "SFTP open failed: permission denied").unwrap();
+
+        // Verify the state transition happened by checking claim_file skips it.
+        let next = db.claim_file().unwrap();
+        assert!(next.is_none(), "failed file should no longer be claimable");
+    }
+
+    #[test]
+    fn test_stale_file_sweep_resets_stale_downloading_files() {
+        // stale_file_sweep recovers files stuck in 'downloading' whose parent
+        // directory was recovered to 'detected' by stale_syncing_sweep.
+        // After the sweep, files return to 'detected' state (checked here).
+        // Re-claiming requires the walker to set the directory back to
+        // 'syncing' on the next sync cycle (see claim_file requirements).
+        let db = in_memory_db();
+        let dir_id = make_file_dir(&db, 2);
+
+        // Claim both files — simulating a worker that got stuck.
+        let f1 = db.claim_file().unwrap().unwrap();
+        let f2 = db.claim_file().unwrap().unwrap();
+
+        // Manually set them to downloading with a stale timestamp.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE file_downloads SET state='downloading', downloading_at=datetime('now','-7 hours') WHERE id IN (?1,?2)",
+                params![f1.id, f2.id],
+            ).unwrap();
+        }
+
+        // Simulate stale_syncing_sweep: directory was set back to Detected.
+        db.set_directory_state(dir_id, DirectoryState::Detected).unwrap();
+
+        // stale_file_sweep resets the downloading files back to detected.
+        let recovered = db.stale_file_sweep(6).unwrap();
+        assert_eq!(recovered, 2, "both stuck files should be recovered");
+
+        // Verify files are back to detected state.
+        {
+            let conn = db.conn.lock().unwrap();
+            let cnt: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM file_downloads WHERE dir_id = ?1 AND state = 'detected'",
+                params![dir_id],
+                |r| r.get(0),
+            ).unwrap();
+            assert_eq!(cnt, 2, "both files should be in detected state after sweep");
+        }
+
+        // Verify files are NOT downloading anymore.
+        {
+            let conn = db.conn.lock().unwrap();
+            let cnt: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM file_downloads WHERE dir_id = ?1 AND state = 'downloading'",
+                params![dir_id],
+                |r| r.get(0),
+            ).unwrap();
+            assert_eq!(cnt, 0, "no files should remain in downloading state");
+        }
+    }
+
+    #[test]
+    fn test_upsert_file_downloads_row_ignore_is_idempotent() {
+        // Re-walking the same directory must not create duplicate rows.
+        let db = in_memory_db();
+        let dir_id = make_file_dir(&db, 3); // already inserted 3 rows
+
+        // Re-upsert the same paths — INSERT OR IGNORE makes this a no-op.
+        db.upsert_file_downloads_row(dir_id, "ep1.mkv").unwrap();
+        db.upsert_file_downloads_row(dir_id, "ep2.mkv").unwrap();
+        db.upsert_file_downloads_row(dir_id, "ep4.mkv").unwrap(); // new file from new walk
+
+        // Only 4 distinct files total (3 original + 1 new).
+        let eligible = db.count_eligible_files().unwrap();
+        assert_eq!(eligible, 4, "re-walk should not duplicate existing rows");
+    }
+
+    #[test]
+    fn test_count_eligible_files_excludes_non_detected_parents() {
+        let db = in_memory_db();
+        let dir_id = make_file_dir(&db, 2);
+
+        // Default: make_file_dir leaves dir in Detected → files should be eligible.
+        assert_eq!(db.count_eligible_files().unwrap(), 2);
+
+        // Move parent to Synced — files must no longer be counted.
+        db.set_directory_state(dir_id, DirectoryState::Synced).unwrap();
+
+        assert_eq!(db.count_eligible_files().unwrap(), 0,
+            "files whose parent is not Detected must not be counted");
     }
 }

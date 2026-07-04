@@ -95,6 +95,21 @@ pub trait Worker: Send + Sync + 'static {
     /// attention" marker).
     fn failure_state(&self) -> DirectoryState;
 
+    /// Count rows remaining for this pool's drain check. Used by the
+    /// generic worker_loop drain condition. The default uses
+    /// `db.count_directories_in_state(self.claim_state())`.
+    /// File-level workers override this with a custom count query.
+    fn count_remaining(&self, db: &Database) -> anyhow::Result<i64> {
+        db.count_directories_in_state(self.claim_state())
+    }
+
+    /// Returns true if this worker manages its own success/failure
+    /// state transitions (e.g. the file-download worker marks
+    /// individual files synced/failed rather than transitioning
+    /// the directory row). When true, the worker_loop skips the
+    /// automatic `set_directory_state` calls after `process()`.
+    fn handles_own_completion(&self) -> bool { false }
+
     /// Atomically claim one row in `claim_state` and transition
     /// it to `in_flight_state`. Returns `Ok(None)` if no row is
     /// available, or `Err` on DB failure (the loop backs off and
@@ -249,7 +264,7 @@ async fn worker_loop<W: Worker>(
         // (the count is non-zero) is rare and bounded by how
         // fast the upstream stage is producing rows.
         if *drain_signal.borrow() {
-            let pending = db.count_directories_in_state(w.claim_state()).unwrap_or_else(|e| {
+            let pending = w.count_remaining(&db).unwrap_or_else(|e| {
                 // If the count itself fails, assume pending = 1
                 // so we keep polling. A DB error here is very
                 // unusual; logging + assuming pending is safer
@@ -298,26 +313,25 @@ async fn worker_loop<W: Worker>(
         // The row is in `in_flight_state` (claim transitioned it).
         let result = w.process(&db, claim.clone()).await;
 
-        match result {
-            Ok(()) => {
-                db.set_directory_state(claim.id, w.success_state())?;
-                info!(worker = w.name(), slot = slot_id, dir_id = claim.id,
-                      "worker: complete");
-            }
-            Err(e) => {
-                let msg = format!("{} failed: {}", w.name(), e);
-                let _ = db.set_directory_error(claim.id, w.failure_state(), &msg);
-                error!(worker = w.name(), slot = slot_id, dir_id = claim.id, error = %e,
-                       "worker: failed");
-                // Halt: returning Err from this loop closes
-                // this slot. The aggregator collects errors
-                // from all slots and propagates the first one.
-                // The row is left in `failure_state` (set
-                // above); the next run's startup will reset it
-                // to the phase's input state via
-                // `upsert_directory`'s `*Failed → input`
-                // transition.
-                return Err(e);
+        // Skip automatic state transitions if the worker manages its own
+        // completion (e.g. file-download worker transitions individual files).
+        if !w.handles_own_completion() {
+            match result {
+                Ok(()) => {
+                    db.set_directory_state(claim.id, w.success_state())?;
+                    info!(worker = w.name(), slot = slot_id, dir_id = claim.id,
+                          "worker: complete");
+                }
+                Err(e) => {
+                    let msg = format!("{} failed: {}", w.name(), e);
+                    let _ = db.set_directory_error(claim.id, w.failure_state(), &msg);
+                    error!(worker = w.name(), slot = slot_id, dir_id = claim.id, error = %e,
+                           "worker: failed");
+                    // Halt: returning Err from this loop closes
+                    // this slot. The aggregator collects errors
+                    // from all slots and propagates the first one.
+                    return Err(e);
+                }
             }
         }
     }
