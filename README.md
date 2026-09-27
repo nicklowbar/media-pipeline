@@ -159,7 +159,13 @@ Integration is filesystem-only: Tdarr watches the same `/library/` mount the pip
 cargo test
 ```
 
-Tests cover config parsing, DB state transitions, rename regex logic, policy selection, library move semantics, Plex URL construction, and the file-download state machine.
+Tests cover config parsing, DB state transitions, rename regex logic, policy selection, library move semantics, Plex URL construction, the file-download state machine, and the pre-download `verify_existing_file` dispositions (including delete-on-corrupt-mismatch).
+
+Outstanding test coverage:
+
+- `try_download_file`'s post-download sha-mismatch path (deletes the corrupt copy before bailing) requires a live SFTP session and has no unit test. It is exercised end-to-end in production. Covering it needs a mock SFTP server harness around `try_download_file`, which would also let the retry wrapper's budget exhaustion and channel-reopen behavior be pinned.
+- The `scripts/*.sh` check and repair scripts have no automated tests; they are covered by shellcheck and by having run against the physalis deployment. A smoke-test mode against a throwaway database would make them CI-able.
+- `claim_file` never re-arms rows whose directory has already left the `detected` state, and `failed` file rows are never reset by the walk, so directories with failed files stall without a manual `reset-failed-retries.sh` run. A regression test pinning the intended recovery policy (and the policy decision itself) is open.
 
 ## Requirements
 
