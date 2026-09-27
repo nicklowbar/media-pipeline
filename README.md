@@ -131,6 +131,22 @@ The file-level state allows multiple files from the same directory to download c
 
 At pipeline startup, a stale-file sweep recovers any files stuck in `downloading` state older than 6 hours — these are reset to `detected` so they can be re-claimed and re-downloaded.
 
+### Checking pipeline state
+
+The full schema reference and the underlying queries live in the physalis database runbook: `TechnicalNotes/Projects/MediaPipeline/physalis-database-runbook.md` in the Obsidian vault at `/media/VideoGames/OneDrive/Documents/Notes/PersonalNotes/PersonalNotes/`.
+
+Read-only check scripts (`scripts/check-*.sh`, all taking an optional hostname defaulting to `physalis`):
+
+| Script | Shows |
+|---|---|
+| `check-state.sh` | Directory and file state distribution, per-category breakdown, metadata cache stats |
+| `check-downloading.sh` | Currently downloading files with live progress (bytes done / expected, from host-side stat of the partial file) |
+| `check-failed.sh` | Failed directories and file downloads with error messages |
+| `check-stale.sh` | In-flight rows older than the 6-hour sweep threshold |
+| `check-queue.sh` | Pending work at both levels: queued directories, queued file jobs, in-flight downloads with live progress, post-download backlog |
+| `check-recent.sh` | Recently moved-to-library directories, library inventory by category |
+| `check-dir.sh <fragment>` | Drilldown on one directory: row, per-file states, hash coverage |
+
 ## Library stewardship (Tdarr)
 
 This pipeline drops files into the library as-is. Re-encoding to a target spec (HEVC/x265, the 4K → 1080p → 720p → 480p quality ladder, support for x264 / AVI / DVD-ISO inputs) is handled by [Tdarr](https://home.tdarr.info/), which walks the library periodically and re-encodes anything that doesn't match its configured health check.
