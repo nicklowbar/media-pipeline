@@ -142,10 +142,15 @@ enum LocalFileDisposition {
     /// The on-disk file matches the remote's claim. Skip the
     /// download path entirely.
     Trust,
-    /// The on-disk file does not exist, is the wrong size, or
-    /// (when a hash is available) has the wrong bytes. Proceed
-    /// to the SFTP read path.
+    /// The on-disk file does not exist or is the wrong size.
+    /// Proceed to the SFTP read path, resuming at the local
+    /// high-water mark.
     Download,
+    /// The on-disk file is the right size but has the wrong
+    /// bytes. Resuming at the local high-water mark would
+    /// transfer nothing, so the caller must delete the copy
+    /// and re-download from byte 0.
+    Delete,
 }
 
 /// Decide whether the file already on disk can be trusted, given
@@ -161,17 +166,18 @@ enum LocalFileDisposition {
 /// of `download_file` will catch any regression there.)
 ///
 /// **Hashing logic.** When `expected_hash` is `Some`, we recompute
-/// the local SHA-256 and compare. A mismatch returns
-/// `LocalFileDisposition::Download` so the corrupt local copy is
-/// discarded and the file is re-pulled from SFTP. The mismatch is
-/// also logged at `warn` level so a persistent mismatch — which
-/// usually means the *recorded* hash is wrong (DB drift, wrong
-/// manifest) — is still visible to the operator. Returning `Err`
-/// instead would propagate up to the downloader pool, halt the
-/// per-directory walk, and crash the process; the post-download
-/// check inside `try_download_file` is the right place to surface
-/// a *truly* persistent mismatch (retry budget exhausted) as a
-/// hard failure.
+/// the local SHA-256 and compare. A mismatch on a right-sized file
+/// returns `LocalFileDisposition::Delete` so the corrupt local copy
+/// is discarded and the file is re-pulled from SFTP from byte 0 —
+/// resuming at the local high-water mark would transfer nothing.
+/// The mismatch is also logged at `warn` level so a persistent
+/// mismatch — which usually means the *recorded* hash is wrong (DB
+/// drift, wrong manifest) — is still visible to the operator.
+/// Returning `Err` instead would propagate up to the downloader
+/// pool, halt the per-directory walk, and crash the process; the
+/// post-download check inside `try_download_file` is the right
+/// place to surface a *truly* persistent mismatch (retry budget
+/// exhausted) as a hard failure.
 ///
 /// **No-hash case.** When `expected_hash` is `None` (the manifest
 /// was collected but `collect_remote_hashes` failed for this
@@ -222,19 +228,22 @@ async fn verify_existing_file(
         // Loud warning + structured log so a persistent
         // mismatch (DB drift, wrong manifest) is still visible
         // to the operator, but treat the disposition as
-        // `Download` so the corrupt local copy is replaced
-        // rather than halting the entire walker. The
-        // post-download check in `try_download_file` will
-        // catch a *truly* persistent mismatch after the retry
-        // budget is exhausted.
+        // `Delete` so the corrupt local copy is removed rather
+        // than halting the entire walker. The copy is right-
+        // sized, so a resume at the local high-water mark
+        // would transfer zero bytes and mismatch again; the
+        // caller deletes it and the retry loop re-downloads
+        // from byte 0. The post-download check in
+        // `try_download_file` will catch a *truly* persistent
+        // mismatch after the retry budget is exhausted.
         warn!(
             file = %local.display(),
             expected = %expected,
             actual = %actual,
-            "sha256 mismatch on existing local file: expected {}, got {}; will re-download",
+            "sha256 mismatch on existing local file: expected {}, got {}; deleting and re-downloading",
             expected, actual
         );
-        Ok(LocalFileDisposition::Download)
+        Ok(LocalFileDisposition::Delete)
     }
 }
 
@@ -934,6 +943,15 @@ async fn download_file(
             LocalFileDisposition::Download => {
                 info!(file = %remote_str, size = remote_size, "local file is wrong size or unverified; re-downloading");
             }
+            LocalFileDisposition::Delete => {
+                // Right-sized but wrong bytes: resume at the
+                // local high-water mark would transfer nothing,
+                // so remove the copy and let the retry loop
+                // re-download from byte 0.
+                info!(file = %remote_str, size = remote_size, "local file failed sha256 verification; deleting and re-downloading from scratch");
+                fs::remove_file(local).await
+                    .with_context(|| format!("failed to delete corrupt local file {}", local.display()))?;
+            }
         }
     }
 
@@ -1314,12 +1332,27 @@ async fn try_download_file(
         let actual = compute_local_sha256(local).await
             .with_context(|| format!("failed to hash local file {}", local.display()))?;
         if actual != expected {
+            // The size check above already passed, so the copy
+            // is right-sized: a resume at the local high-water
+            // mark on the next attempt would transfer zero
+            // bytes and mismatch identically. Delete the copy
+            // so the retry wrapper re-downloads from byte 0;
+            // the retry budget is what surfaces a truly
+            // persistent mismatch as a hard failure.
             error!(
                 file = %remote_str,
                 expected = %expected,
                 actual = %actual,
                 "sha256 mismatch: remote and local hashes disagree; file is corrupt"
             );
+            match fs::remove_file(local).await {
+                Ok(()) => {
+                    warn!(file = %remote_str, "deleted corrupt local copy; next attempt re-downloads from scratch");
+                }
+                Err(rm_err) => {
+                    warn!(file = %remote_str, error = %rm_err, "failed to delete corrupt local copy; next attempt may resume at the corrupt high-water mark");
+                }
+            }
             anyhow::bail!(
                 "sha256 mismatch for {}: expected {}, got {}",
                 remote_str, expected, actual
@@ -3254,11 +3287,13 @@ mod tests {
     /// Size matches, hash does NOT match. The local file is at
     /// the right size but with the wrong bytes — exactly the
     /// silent-corruption case the user reported. The disposition
-    /// must be `Download` (re-pull from SFTP), not `Trust` and
-    /// not `Err` (which would halt the walker). The mismatch is
-    /// still surfaced to the operator via a `warn!` log.
+    /// must be `Delete` (remove the copy, re-pull from SFTP at
+    /// byte 0), not `Download` (a resume at the local high-water
+    /// mark would transfer nothing) and not `Trust` and not `Err`
+    /// (which would halt the walker). The mismatch is still
+    /// surfaced to the operator via a `warn!` log.
     #[tokio::test]
-    async fn test_verify_downloads_on_hash_mismatch() {
+    async fn test_verify_deletes_on_hash_mismatch() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("file.bin");
         // Write the "actual" bytes; claim the hash is for
@@ -3274,8 +3309,8 @@ mod tests {
         ).await.expect("hash mismatch must NOT surface as Err (that would halt the walker)");
         assert_eq!(
             got,
-            LocalFileDisposition::Download,
-            "hash mismatch should trigger re-download, not Trust"
+            LocalFileDisposition::Delete,
+            "hash mismatch should trigger delete-and-re-download, not resume"
         );
     }
 
